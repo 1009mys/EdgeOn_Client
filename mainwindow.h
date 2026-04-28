@@ -13,6 +13,10 @@ class QDockWidget;
 class QListWidget;
 class QListWidgetItem;
 class QLineEdit;
+class QComboBox;
+class QCheckBox;
+class QSpinBox;
+struct camera_info;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -33,6 +37,7 @@ private slots:
     void loadUrlsFromFile ();
     void removeAllStreams ();
     void addStreamAddress();
+    void updateSelectedStreamAddress();
     void removeSelectedStreamAddress();
     void onStreamListDoubleClicked(QListWidgetItem* item);
 
@@ -48,6 +53,11 @@ private:
     void removeStream(int cellId);
     void updateStatusBar();
 
+    void loadCameraListFromDB();
+    bool saveCameraToDB(const camera_info& camera);
+    void addCameraListItem(const camera_info& camera);
+    void resetInlineCameraForm(bool clearSelection = false);
+
     QWidget*                 m_central{nullptr};
     QGridLayout*             m_grid{nullptr};
     int                      m_visibleRows{4};
@@ -56,9 +66,13 @@ private:
     QString                  m_layoutName{"4x4"};
     QDockWidget*             m_streamDock{nullptr};
     QListWidget*             m_streamList{nullptr};
+    QSpinBox*                m_cameraIdInput{nullptr};
+    QLineEdit*               m_nameInput{nullptr};
+    QComboBox*               m_streamTypeInput{nullptr};
     QLineEdit*               m_streamInput{nullptr};
+    QCheckBox*               m_enabledInput{nullptr};
     QVector<VideoCell*>      m_cells;
     QMap<int, StreamWorker*> m_workers;
     QLabel*                  m_statusLabel{nullptr};
+    int                      m_nextCameraId{1};
 };
-

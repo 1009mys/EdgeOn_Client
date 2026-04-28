@@ -1,4 +1,7 @@
 #include "mainwindow.h"
+
+#include "DBManager.h"
+
 #include <QWidget>
 #include <QGridLayout>
 #ifdef Q_OS_WIN
@@ -10,6 +13,7 @@
 #include <QLabel>
 #include <QFileDialog>
 #include <QFile>
+#include <QFileInfo>
 #include <QTextStream>
 #include <QMessageBox>
 #include <QThread>
@@ -21,10 +25,166 @@
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QCheckBox>
+#include <QFormLayout>
+#include <QComboBox>
+#include <QSpinBox>
 #include <QAbstractItemView>
 #include <QDrag>
 #include <QMimeData>
+#include <QSignalBlocker>
+#include <QSettings>
 #include <opencv2/core/cuda.hpp>
+
+namespace {
+
+constexpr int kCameraIdRole = Qt::UserRole + 1;
+constexpr int kCameraNameRole = Qt::UserRole + 2;
+constexpr int kCameraStreamTypeRole = Qt::UserRole + 3;
+constexpr int kCameraEnabledRole = Qt::UserRole + 4;
+constexpr int kCameraUrlRole = Qt::UserRole + 5;
+constexpr const char* kCameraFormExpandedSetting = "ui/streamList/cameraFormExpanded";
+
+QString streamTypeToText(StreamType type) {
+    switch (type) {
+    case StreamType::RTSP: return "RTSP";
+    case StreamType::ONVIF: return "ONVIF";
+    }
+    return "Unknown";
+}
+
+QString makeCameraTooltip(const camera_info& camera) {
+    return QString("camera_id: %1\nname: %2\nstream_type: %3\nenabled: %4\nurl: %5")
+        .arg(camera.camera_id)
+        .arg(QString::fromStdString(camera.name))
+        .arg(streamTypeToText(camera.stream_type))
+        .arg(camera.enabled ? "true" : "false")
+        .arg(QString::fromStdString(camera.url));
+}
+
+QString makeCameraDisplayText(const camera_info& camera) {
+    const QString name = QString::fromStdString(camera.name).trimmed();
+    const QString url = QString::fromStdString(camera.url).trimmed();
+    if (name.isEmpty() || name == url) {
+        return url;
+    }
+    return QString("%1 (%2)").arg(name, url);
+}
+
+bool listHasUrl(const QListWidget* list, const QString& url) {
+    if (!list) return false;
+    const QString target = url.trimmed();
+    if (target.isEmpty()) return false;
+
+    for (int i = 0; i < list->count(); ++i) {
+        const auto* item = list->item(i);
+        if (!item) continue;
+
+        const QString itemUrl = item->data(kCameraUrlRole).toString().trimmed().isEmpty()
+                                    ? item->text().trimmed()
+                                    : item->data(kCameraUrlRole).toString().trimmed();
+        if (itemUrl == target) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool listHasCameraId(const QListWidget* list, int cameraId) {
+    if (!list || cameraId <= 0) return false;
+
+    for (int i = 0; i < list->count(); ++i) {
+        const auto* item = list->item(i);
+        if (!item) continue;
+        if (item->data(kCameraIdRole).toInt() == cameraId) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool parseStreamType(const QString& text, StreamType& outType) {
+    const QString normalized = text.trimmed().toUpper();
+    if (normalized == "RTSP") {
+        outType = StreamType::RTSP;
+        return true;
+    }
+    if (normalized == "ONVIF") {
+        outType = StreamType::ONVIF;
+        return true;
+    }
+    return false;
+}
+
+bool parseEnabledValue(const QString& text, bool& outEnabled) {
+    const QString normalized = text.trimmed().toLower();
+    if (normalized == "1" || normalized == "true" || normalized == "y" || normalized == "yes") {
+        outEnabled = true;
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "n" || normalized == "no") {
+        outEnabled = false;
+        return true;
+    }
+    return false;
+}
+
+bool isCameraCsvHeader(const QStringList& cols) {
+    if (cols.size() < 5) return false;
+    const QString c0 = cols[0].trimmed().toLower();
+    const QString c1 = cols[1].trimmed().toLower();
+    const QString c2 = cols[2].trimmed().toLower();
+    const QString c3 = cols[3].trimmed().toLower();
+    const QString c4 = cols[4].trimmed().toLower();
+    return c0 == "id" && c1 == "name" && c2 == "url" && c3 == "type" && c4 == "enabled";
+}
+
+bool parseCameraCsvLine(const QString& line, camera_info& camera) {
+    const QStringList cols = line.split(',', Qt::KeepEmptyParts);
+    if (cols.size() < 5) {
+        return false;
+    }
+
+    bool idOk = false;
+    const int cameraId = cols[0].trimmed().toInt(&idOk);
+    if (!idOk || cameraId <= 0) {
+        return false;
+    }
+
+    StreamType type = StreamType::RTSP;
+    if (!parseStreamType(cols[3], type)) {
+        return false;
+    }
+
+    bool enabled = true;
+    if (!parseEnabledValue(cols[4], enabled)) {
+        return false;
+    }
+
+    const QString url = cols[2].trimmed();
+    if (url.isEmpty()) {
+        return false;
+    }
+
+    QString name = cols[1].trimmed();
+    if (name.isEmpty()) {
+        name = url;
+    }
+
+    camera = {};
+    camera.camera_id = cameraId;
+    camera.name = name.toStdString();
+    camera.stream_type = type;
+    camera.url = url.toStdString();
+    camera.enabled = enabled;
+    return true;
+}
+
+}
 
 class StreamListWidget final : public QListWidget {
 public:
@@ -35,11 +195,13 @@ protected:
         auto* item = currentItem();
         if (!item) return;
 
-        const QString text = item->text().trimmed();
-        if (text.isEmpty()) return;
+        const QString url = item->data(kCameraUrlRole).toString().trimmed().isEmpty()
+                                ? item->text().trimmed()
+                                : item->data(kCameraUrlRole).toString().trimmed();
+        if (url.isEmpty()) return;
 
         auto* mime = new QMimeData();
-        mime->setText(text);
+        mime->setText(url);
         auto* drag = new QDrag(this);
         drag->setMimeData(mime);
         drag->exec(supportedActions, Qt::CopyAction);
@@ -149,19 +311,74 @@ void MainWindow::buildStreamListPanel() {
     vbox->setContentsMargins(6, 6, 6, 6);
     vbox->setSpacing(6);
 
+    m_cameraIdInput = new QSpinBox(panel);
+    m_cameraIdInput->setRange(1, 2147483647);
+    m_cameraIdInput->setValue(m_nextCameraId);
+
+    m_nameInput = new QLineEdit(panel);
+    m_nameInput->setPlaceholderText("카메라 이름");
+
+    m_streamTypeInput = new QComboBox(panel);
+    m_streamTypeInput->addItem("RTSP", static_cast<int>(StreamType::RTSP));
+    m_streamTypeInput->addItem("ONVIF", static_cast<int>(StreamType::ONVIF));
+
     m_streamInput = new QLineEdit(panel);
-    m_streamInput->setPlaceholderText("RTSP 주소 입력 (예: rtsp://...)");
+    m_streamInput->setPlaceholderText("스트림 주소 (예: rtsp://...)");
     connect(m_streamInput, &QLineEdit::returnPressed, this, &MainWindow::addStreamAddress);
 
+    m_enabledInput = new QCheckBox("활성", panel);
+    m_enabledInput->setChecked(true);
+
+    auto* form = new QFormLayout();
+    form->setContentsMargins(0, 0, 0, 0);
+    form->setSpacing(4);
+    form->addRow("camera_id", m_cameraIdInput);
+    form->addRow("이름", m_nameInput);
+    form->addRow("스트림 타입", m_streamTypeInput);
+    form->addRow("URL", m_streamInput);
+    form->addRow("상태", m_enabledInput);
+
     auto* addBtn = new QPushButton("추가", panel);
+    auto* editBtn = new QPushButton("수정", panel);
     auto* delBtn = new QPushButton("삭제", panel);
     connect(addBtn, &QPushButton::clicked, this, &MainWindow::addStreamAddress);
+    connect(editBtn, &QPushButton::clicked, this, &MainWindow::updateSelectedStreamAddress);
     connect(delBtn, &QPushButton::clicked, this, &MainWindow::removeSelectedStreamAddress);
 
     auto* btnRow = new QHBoxLayout();
     btnRow->setContentsMargins(0, 0, 0, 0);
     btnRow->addWidget(addBtn);
+    btnRow->addWidget(editBtn);
     btnRow->addWidget(delBtn);
+
+    auto* formContainer = new QWidget(panel);
+    auto* formContainerLayout = new QVBoxLayout(formContainer);
+    formContainerLayout->setContentsMargins(0, 0, 0, 0);
+    formContainerLayout->setSpacing(4);
+    formContainerLayout->addLayout(form);
+    formContainerLayout->addLayout(btnRow);
+
+    auto* foldButton = new QToolButton(panel);
+    foldButton->setCheckable(true);
+    foldButton->setChecked(true);
+    foldButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    foldButton->setArrowType(Qt::DownArrow);
+    foldButton->setText("카메라 정보");
+
+    connect(foldButton, &QToolButton::toggled, this,
+            [formContainer, foldButton](bool expanded) {
+                formContainer->setVisible(expanded);
+                foldButton->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+                QSettings settings;
+                settings.setValue(kCameraFormExpandedSetting, expanded);
+                settings.sync();
+            });
+
+    {
+        QSettings settings;
+        const bool expanded = settings.value(kCameraFormExpandedSetting, true).toBool();
+        foldButton->setChecked(expanded);
+    }
 
     m_streamList = new StreamListWidget(panel);
     m_streamList->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -171,13 +388,40 @@ void MainWindow::buildStreamListPanel() {
     connect(m_streamList, &QListWidget::itemDoubleClicked,
             this, &MainWindow::onStreamListDoubleClicked);
 
-    vbox->addWidget(m_streamInput);
-    vbox->addLayout(btnRow);
+    // 선택한 항목을 인라인 입력 폼으로 가져와 수정 흐름을 단순화
+    connect(m_streamList, &QListWidget::currentItemChanged,
+            this, [this](QListWidgetItem* current, QListWidgetItem*) {
+                if (!m_cameraIdInput || !m_nameInput || !m_streamTypeInput || !m_streamInput || !m_enabledInput)
+                    return;
+                if (!current) {
+                    resetInlineCameraForm(false);
+                    return;
+                }
+
+                const int cameraId = current->data(kCameraIdRole).toInt();
+                if (cameraId > 0) m_cameraIdInput->setValue(cameraId);
+                m_nameInput->setText(current->data(kCameraNameRole).toString());
+
+                const int streamType = current->data(kCameraStreamTypeRole).toInt();
+                const int idx = m_streamTypeInput->findData(streamType);
+                m_streamTypeInput->setCurrentIndex(idx >= 0 ? idx : 0);
+
+                const QString url = current->data(kCameraUrlRole).toString().trimmed().isEmpty()
+                                        ? current->text().trimmed()
+                                        : current->data(kCameraUrlRole).toString().trimmed();
+                m_streamInput->setText(url);
+                m_enabledInput->setChecked(current->data(kCameraEnabledRole).toBool());
+            });
+
+    vbox->addWidget(foldButton);
+    vbox->addWidget(formContainer);
     vbox->addWidget(m_streamList, 1);
 
     panel->setLayout(vbox);
     m_streamDock->setWidget(panel);
     addDockWidget(Qt::LeftDockWidgetArea, m_streamDock);
+
+    loadCameraListFromDB();
 }
 
 void MainWindow::addLayoutPresetAction(QMenu* menu, const QString& text, int rows, int cols) {
@@ -337,30 +581,125 @@ void MainWindow::onStatusChanged(int cellId, const QString& status) {
 }
 
 void MainWindow::addStreamAddress() {
-    if (!m_streamInput || !m_streamList) return;
+    if (!m_cameraIdInput || !m_nameInput || !m_streamTypeInput || !m_streamInput || !m_enabledInput || !m_streamList)
+        return;
 
-    const QString url = m_streamInput->text().trimmed();
-    if (url.isEmpty()) return;
+    camera_info camera{};
+    camera.camera_id = m_cameraIdInput->value();
+    camera.name = m_nameInput->text().trimmed().toStdString();
+    camera.stream_type = static_cast<StreamType>(m_streamTypeInput->currentData().toInt());
+    camera.url = m_streamInput->text().trimmed().toStdString();
+    camera.enabled = m_enabledInput->isChecked();
 
-    const auto found = m_streamList->findItems(url, Qt::MatchFixedString);
-    if (!found.isEmpty()) {
-        m_streamList->setCurrentItem(found.first());
-        m_streamInput->clear();
+    if (QString::fromStdString(camera.url).trimmed().isEmpty()) {
+        QMessageBox::warning(this, "입력 오류", "URL은 비어 있을 수 없습니다.");
+        return;
+    }
+    if (QString::fromStdString(camera.name).trimmed().isEmpty()) {
+        camera.name = camera.url;
+    }
+
+    if (!saveCameraToDB(camera)) {
         return;
     }
 
-    m_streamList->addItem(url);
-    m_streamInput->clear();
+    addCameraListItem(camera);
+    m_nextCameraId = qMax(m_nextCameraId, camera.camera_id + 1);
+    resetInlineCameraForm(false);
+}
+
+void MainWindow::updateSelectedStreamAddress()
+{
+    if (!m_streamList || !m_cameraIdInput || !m_nameInput || !m_streamTypeInput || !m_streamInput || !m_enabledInput)
+        return;
+
+    auto* item = m_streamList->currentItem();
+    if (!item) return;
+
+    const int oldCameraId = item->data(kCameraIdRole).toInt();
+    if (oldCameraId <= 0) {
+        QMessageBox::warning(this, "오류", "선택 항목의 camera_id가 올바르지 않습니다.");
+        return;
+    }
+
+    camera_info camera{};
+    camera.camera_id = m_cameraIdInput->value();
+    camera.name = m_nameInput->text().trimmed().toStdString();
+    camera.stream_type = static_cast<StreamType>(m_streamTypeInput->currentData().toInt());
+    camera.url = m_streamInput->text().trimmed().toStdString();
+    camera.enabled = m_enabledInput->isChecked();
+
+    if (QString::fromStdString(camera.url).trimmed().isEmpty()) {
+        QMessageBox::warning(this, "입력 오류", "URL은 비어 있을 수 없습니다.");
+        return;
+    }
+    if (QString::fromStdString(camera.name).trimmed().isEmpty()) {
+        camera.name = camera.url;
+    }
+
+    if (camera.camera_id == oldCameraId) {
+        auto updateResult = DBManager::instance().updateCameraByCameraId(camera);
+        if (!updateResult) {
+            QMessageBox::warning(this, "DB 오류", "카메라 수정 실패:\n" + updateResult.error());
+            return;
+        }
+    } else {
+        const auto existing = DBManager::instance().getCameraByCameraId(camera.camera_id);
+        if (existing) {
+            QMessageBox::warning(this, "중복", "변경하려는 camera_id가 이미 존재합니다.");
+            return;
+        }
+
+        auto addResult = DBManager::instance().addCamera(camera);
+        if (!addResult) {
+            QMessageBox::warning(this, "DB 오류", "camera_id 변경용 신규 저장 실패:\n" + addResult.error());
+            return;
+        }
+
+        auto deleteResult = DBManager::instance().deleteCameraByCameraId(oldCameraId);
+        if (!deleteResult) {
+            static_cast<void>(DBManager::instance().deleteCameraByCameraId(camera.camera_id));
+            QMessageBox::warning(this, "DB 오류", "기존 camera_id 삭제 실패로 변경을 취소했습니다:\n" + deleteResult.error());
+            return;
+        }
+    }
+
+    item->setText(makeCameraDisplayText(camera));
+    item->setData(kCameraIdRole, camera.camera_id);
+    item->setData(kCameraNameRole, QString::fromStdString(camera.name));
+    item->setData(kCameraStreamTypeRole, static_cast<int>(camera.stream_type));
+    item->setData(kCameraEnabledRole, camera.enabled);
+    item->setData(kCameraUrlRole, QString::fromStdString(camera.url));
+    item->setToolTip(makeCameraTooltip(camera));
+    m_nextCameraId = qMax(m_nextCameraId, camera.camera_id + 1);
+    m_streamInput->setText(QString::fromStdString(camera.url));
 }
 
 void MainWindow::removeSelectedStreamAddress() {
     if (!m_streamList) return;
-    delete m_streamList->takeItem(m_streamList->currentRow());
+
+    const int row = m_streamList->currentRow();
+    if (row < 0) return;
+
+    auto* item = m_streamList->item(row);
+    const int cameraId = item ? item->data(kCameraIdRole).toInt() : 0;
+    if (cameraId > 0) {
+        auto deleteResult = DBManager::instance().deleteCameraByCameraId(cameraId);
+        if (!deleteResult) {
+            QMessageBox::warning(this, "DB 오류", "카메라 삭제 실패:\n" + deleteResult.error());
+            return;
+        }
+    }
+
+    delete m_streamList->takeItem(row);
+    resetInlineCameraForm(true);
 }
 
 void MainWindow::onStreamListDoubleClicked(QListWidgetItem* item) {
     if (!item) return;
-    const QString url = item->text().trimmed();
+    const QString url = item->data(kCameraUrlRole).toString().trimmed().isEmpty()
+                            ? item->text().trimmed()
+                            : item->data(kCameraUrlRole).toString().trimmed();
     if (url.isEmpty()) return;
 
     // 표시 중인 슬롯 중 첫 번째 빈 칸에 스트림을 시작한다.
@@ -377,8 +716,10 @@ void MainWindow::onStreamListDoubleClicked(QListWidgetItem* item) {
 void MainWindow::loadUrlsFromFile() {
     const QString path = QFileDialog::getOpenFileName(
         this, "URL 목록 파일 선택", {},
-        "텍스트 파일 (*.txt);;모든 파일 (*)");
+        "가져오기 파일 (*.txt *.csv);;텍스트 파일 (*.txt);;CSV 파일 (*.csv);;모든 파일 (*)");
     if (path.isEmpty()) return;
+
+    const bool isCsvFile = QFileInfo(path).suffix().compare("csv", Qt::CaseInsensitive) == 0;
 
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -386,14 +727,97 @@ void MainWindow::loadUrlsFromFile() {
         return;
     }
 
+    // 옵션 다이얼로그: 체크박스만 추가하면 쉽게 확장할 수 있다.
+    QDialog optionDialog(this);
+    optionDialog.setWindowTitle("불러오기 옵션");
+    optionDialog.setModal(true);
+
+    auto* optionLayout = new QVBoxLayout(&optionDialog);
+    optionLayout->setContentsMargins(12, 12, 12, 12);
+    optionLayout->setSpacing(8);
+
+    auto* removeDuplicatesCheck = new QCheckBox("기존 목록과 중복되는 URL 제거", &optionDialog);
+    removeDuplicatesCheck->setChecked(false);
+    optionLayout->addWidget(removeDuplicatesCheck);
+
+    auto* buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &optionDialog);
+    connect(buttonBox, &QDialogButtonBox::accepted, &optionDialog, &QDialog::accept);
+    connect(buttonBox, &QDialogButtonBox::rejected, &optionDialog, &QDialog::reject);
+    optionLayout->addWidget(buttonBox);
+
+    if (optionDialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    const bool removeDuplicates = removeDuplicatesCheck->isChecked();
+
     QTextStream in(&f);
+    int lineNo = 0;
+    int addedCount = 0;
+    int skippedCount = 0;
+    int invalidCount = 0;
+
     while (!in.atEnd()) {
-        const QString line = in.readLine().trimmed();
+        ++lineNo;
+        QString line = in.readLine();
+        if (lineNo == 1 && !line.isEmpty() && line[0] == QChar::ByteOrderMark) {
+            line.remove(0, 1);
+        }
+        line = line.trimmed();
+
         if (line.isEmpty() || line.startsWith('#'))
             continue;
-        if (m_streamList->findItems(line, Qt::MatchFixedString).isEmpty())
-            m_streamList->addItem(line);
+
+        camera_info camera{};
+        if (isCsvFile) {
+            const QStringList cols = line.split(',', Qt::KeepEmptyParts);
+            if (isCameraCsvHeader(cols)) {
+                continue;
+            }
+            if (!parseCameraCsvLine(line, camera)) {
+                ++invalidCount;
+                continue;
+            }
+        } else {
+            camera.camera_id = m_nextCameraId;
+            camera.name = line.toStdString();
+            camera.stream_type = StreamType::RTSP;
+            camera.url = line.toStdString();
+            camera.enabled = true;
+        }
+
+        const QString cameraUrl = QString::fromStdString(camera.url);
+        if (removeDuplicates && listHasUrl(m_streamList, cameraUrl)) {
+            ++skippedCount;
+            continue;
+        }
+
+        if (listHasCameraId(m_streamList, camera.camera_id)) {
+            ++skippedCount;
+            continue;
+        }
+
+        if (!saveCameraToDB(camera)) {
+            ++invalidCount;
+            continue;
+        }
+
+        addCameraListItem(camera);
+        m_nextCameraId = qMax(m_nextCameraId, camera.camera_id + 1);
+        ++addedCount;
     }
+
+    if (m_cameraIdInput && !m_streamList->currentItem()) {
+        m_cameraIdInput->setValue(m_nextCameraId);
+    }
+
+    QMessageBox::information(
+        this,
+        "가져오기 결과",
+        QString("추가: %1건\n중복/충돌로 건너뜀: %2건\n형식 오류/저장 실패: %3건")
+            .arg(addedCount)
+            .arg(skippedCount)
+            .arg(invalidCount));
 }
 
 void MainWindow::removeAllStreams() {
@@ -449,5 +873,82 @@ void MainWindow::updateStatusBar() {
             .arg(m_layoutName)
             .arg(m_visibleSlotCount)
                        .arg(active).arg(TOTAL));
+}
+
+void MainWindow::loadCameraListFromDB()
+{
+    if (!m_streamList) return;
+
+    auto listResult = DBManager::instance().listCameras();
+    if (!listResult) {
+        QMessageBox::warning(this, "DB 오류", "카메라 목록 로드 실패:\n" + listResult.error());
+        return;
+    }
+
+    int maxCameraId = 0;
+    for (const auto& camera : listResult.value()) {
+        addCameraListItem(camera);
+        if (camera.camera_id > maxCameraId) {
+            maxCameraId = camera.camera_id;
+        }
+    }
+
+    m_nextCameraId = maxCameraId + 1;
+    if (m_nextCameraId <= 0) {
+        m_nextCameraId = 1;
+    }
+
+    if (m_cameraIdInput && !m_streamList->currentItem()) {
+        m_cameraIdInput->setValue(m_nextCameraId);
+    }
+}
+
+bool MainWindow::saveCameraToDB(const camera_info& camera)
+{
+    auto addResult = DBManager::instance().addCamera(camera);
+    if (!addResult) {
+        QMessageBox::warning(this, "DB 오류", "카메라 저장 실패:\n" + addResult.error());
+        return false;
+    }
+
+    return true;
+}
+
+void MainWindow::addCameraListItem(const camera_info& camera)
+{
+    if (!m_streamList) return;
+
+    const QString url = QString::fromStdString(camera.url);
+    auto* item = new QListWidgetItem(makeCameraDisplayText(camera), m_streamList);
+    item->setData(kCameraIdRole, camera.camera_id);
+    item->setData(kCameraNameRole, QString::fromStdString(camera.name));
+    item->setData(kCameraStreamTypeRole, static_cast<int>(camera.stream_type));
+    item->setData(kCameraEnabledRole, camera.enabled);
+    item->setData(kCameraUrlRole, url);
+    item->setToolTip(makeCameraTooltip(camera));
+}
+
+void MainWindow::resetInlineCameraForm(bool clearSelection)
+{
+    if (clearSelection && m_streamList) {
+        const QSignalBlocker blocker(m_streamList);
+        m_streamList->setCurrentItem(nullptr);
+    }
+
+    if (m_cameraIdInput) {
+        m_cameraIdInput->setValue(m_nextCameraId);
+    }
+    if (m_nameInput) {
+        m_nameInput->clear();
+    }
+    if (m_streamTypeInput) {
+        m_streamTypeInput->setCurrentIndex(0);
+    }
+    if (m_streamInput) {
+        m_streamInput->clear();
+    }
+    if (m_enabledInput) {
+        m_enabledInput->setChecked(true);
+    }
 }
 
