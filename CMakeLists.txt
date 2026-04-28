@@ -4,6 +4,14 @@ project(EdgeOn_Client LANGUAGES CUDA CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
+include(GNUInstallDirs)
+
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT
+   OR CMAKE_INSTALL_PREFIX STREQUAL "C:/Program Files/${PROJECT_NAME}"
+   OR CMAKE_INSTALL_PREFIX STREQUAL "C:/Program Files (x86)/${PROJECT_NAME}")
+    set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "Install path prefix." FORCE)
+endif()
+
 # ── CUDA 툴킷 찾기 ───────────────────────────────────────────────
 find_package(CUDAToolkit 12.9 EXACT REQUIRED )
 
@@ -26,12 +34,15 @@ else()
 endif()
 
 # ── OpenCV 경로 분기 ────────────────────────────────────────────
-set(OpenCV_DIR "E:/library_source/opencv/opencv-4.13.0/build")
-set(OpenCV_INCLUDE_DIRS "E:/library_source/opencv/opencv-4.13.0/build/include")
-set(OpenCV_LIB_DIR "E:/library_source/opencv/opencv-4.13.0/build/x64/vc17/lib")
-set(OpenCV_DLL_RELEASE "E:/library_source/opencv/opencv-4.13.0/build/x64/vc17/bin/opencv_world4130.dll")
-set(OpenCV_DLL_DEBUG "E:/library_source/opencv/opencv-4.13.0/build/x64/vc17/bin/opencv_world4130d.dll")
-set(OpenCV_FFMPEG_DLL "E:/library_source/opencv/opencv-4.13.0/build/x64/vc17/bin/opencv_videoio_ffmpeg4130_64.dll")
+if (WIN32)
+    set(OpenCV_DIR "E:/library_source/opencv/opencv-4.13.0/build")
+    set(OpenCV_INCLUDE_DIRS "E:/library_source/opencv/opencv-4.13.0/build/include")
+    set(OpenCV_LIB_DIR "E:/library_source/opencv/opencv-4.13.0/build/x64/vc17/lib")
+    set(OpenCV_DLL_RELEASE "E:/library_source/opencv/opencv-4.13.0/build/x64/vc17/bin/opencv_world4130.dll")
+    set(OpenCV_DLL_DEBUG "E:/library_source/opencv/opencv-4.13.0/build/x64/vc17/bin/opencv_world4130d.dll")
+    set(OpenCV_FFMPEG_DLL "E:/library_source/opencv/opencv-4.13.0/build/x64/vc17/bin/opencv_videoio_ffmpeg4130_64.dll")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+endif ()
 
 # ── 패키지 탐색 ─────────────────────────────────────────────────
 find_package(Qt6 COMPONENTS Widgets Sql REQUIRED)
@@ -49,6 +60,12 @@ add_executable(EdgeOn_Client
     streamworker.h   streamworker.cpp
     videocell.h      videocell.cpp
     mainwindow.h     mainwindow.cpp
+)
+
+set_target_properties(EdgeOn_Client PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/output/$<CONFIG>/${CMAKE_INSTALL_BINDIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/output/$<CONFIG>/${CMAKE_INSTALL_LIBDIR}"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/output/$<CONFIG>/${CMAKE_INSTALL_LIBDIR}"
 )
 
 target_link_libraries(EdgeOn_Client PRIVATE
@@ -71,10 +88,22 @@ endif()
 
 target_include_directories(EdgeOn_Client PRIVATE ${OpenCV_INCLUDE_DIRS})
 
+install(TARGETS EdgeOn_Client
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    BUNDLE DESTINATION .
+)
+
 if(WIN32)
     get_target_property(_qt_qmake_executable Qt6::qmake IMPORTED_LOCATION)
     get_filename_component(_qt_bin_dir "${_qt_qmake_executable}" DIRECTORY)
     set(_windeployqt_executable "${_qt_bin_dir}/windeployqt.exe")
+
+    get_target_property(_edgeon_output_name EdgeOn_Client OUTPUT_NAME)
+    if(NOT _edgeon_output_name)
+        set(_edgeon_output_name "EdgeOn_Client")
+    endif()
+    set(EDGEON_EXECUTABLE_NAME "${_edgeon_output_name}${CMAKE_EXECUTABLE_SUFFIX}")
 
     set(_opencv_runtime_copy_commands
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -89,6 +118,24 @@ if(WIN32)
                 "${OpenCV_FFMPEG_DLL}"
                 "$<TARGET_FILE_DIR:EdgeOn_Client>"
         )
+
+        install(FILES "${OpenCV_FFMPEG_DLL}"
+            DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+    endif()
+
+    if(EXISTS "${OpenCV_DLL_DEBUG}")
+        install(FILES "${OpenCV_DLL_DEBUG}"
+            DESTINATION ${CMAKE_INSTALL_BINDIR}
+            CONFIGURATIONS Debug
+        )
+    endif()
+
+    if(EXISTS "${OpenCV_DLL_RELEASE}")
+        install(FILES "${OpenCV_DLL_RELEASE}"
+            DESTINATION ${CMAKE_INSTALL_BINDIR}
+            CONFIGURATIONS Release RelWithDebInfo MinSizeRel
+        )
     endif()
 
     if(EXISTS "${_windeployqt_executable}")
@@ -102,8 +149,37 @@ if(WIN32)
                 "$<TARGET_FILE:EdgeOn_Client>"
             VERBATIM
         )
+
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/DeployQt.cmake.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/DeployQt.cmake"
+            @ONLY
+        )
+        install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/DeployQt.cmake")
     else()
         message(WARNING "windeployqt not found: ${_windeployqt_executable}")
     endif()
 endif()
+
+if(NOT PROJECT_VERSION)
+    set(_edgeon_package_version "0.1.0")
+else()
+    set(_edgeon_package_version "${PROJECT_VERSION}")
+endif()
+
+set(CPACK_PACKAGE_NAME "EdgeOn_Client")
+set(CPACK_PACKAGE_VENDOR "EdgeOn")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "EdgeOn multi-channel RTSP client")
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "EdgeOn_Client")
+set(CPACK_PACKAGE_VERSION "${_edgeon_package_version}")
+set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+
+if(WIN32)
+    set(CPACK_GENERATOR "NSIS")
+    set(CPACK_NSIS_DISPLAY_NAME "EdgeOn Client")
+    set(CPACK_NSIS_PACKAGE_NAME "EdgeOn Client")
+    set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+endif()
+
+include(CPack)
 

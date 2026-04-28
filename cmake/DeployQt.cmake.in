@@ -1,0 +1,31 @@
+if(NOT EXISTS "@_windeployqt_executable@")
+	message(WARNING "windeployqt not found: @_windeployqt_executable@")
+	return()
+endif()
+
+set(_edgeon_install_bindir "${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_BINDIR@")
+set(_edgeon_installed_exe "${_edgeon_install_bindir}/@EDGEON_EXECUTABLE_NAME@")
+
+if(NOT EXISTS "${_edgeon_installed_exe}")
+	message(FATAL_ERROR "Installed executable not found: ${_edgeon_installed_exe}")
+endif()
+
+if(CMAKE_INSTALL_CONFIG_NAME MATCHES "^Debug$")
+	set(_edgeon_qt_deploy_mode --debug)
+else()
+	set(_edgeon_qt_deploy_mode --release)
+endif()
+
+execute_process(
+	COMMAND "@_windeployqt_executable@"
+		${_edgeon_qt_deploy_mode}
+		--no-translations
+		--no-compiler-runtime
+		"${_edgeon_installed_exe}"
+	WORKING_DIRECTORY "${_edgeon_install_bindir}"
+	RESULT_VARIABLE _edgeon_deploy_result
+)
+
+if(NOT _edgeon_deploy_result EQUAL 0)
+	message(FATAL_ERROR "windeployqt failed with exit code ${_edgeon_deploy_result}")
+endif()
