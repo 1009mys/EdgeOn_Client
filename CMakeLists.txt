@@ -56,14 +56,14 @@ set(CMAKE_AUTORCC ON)
 
 # ── 타겟 ────────────────────────────────────────────────────────
 add_executable(EdgeOn_Client
-    main.cpp
-    streamworker.h   streamworker.cpp
-    videocell.h      videocell.cpp
-    mainwindow.h     mainwindow.cpp
-        DBManager.cpp
-        DBManager.h
-        DBManager_cameras.cpp
-        Protocol.h
+        src/main.cpp
+        include/streamworker.h src/streamworker.cpp
+        include/videocell.h src/videocell.cpp
+        include/mainwindow.h src/mainwindow.cpp
+        src/DBManager.cpp
+        include/DBManager.h
+        src/DBManager_cameras.cpp
+        include/Protocol.h
 )
 
 set_target_properties(EdgeOn_Client PROPERTIES
@@ -90,7 +90,10 @@ if(WIN32)
     target_link_libraries(EdgeOn_Client PRIVATE d2d1 dwrite d3d11 dxgi)
 endif()
 
-target_include_directories(EdgeOn_Client PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_include_directories(EdgeOn_Client PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
 
 install(TARGETS EdgeOn_Client
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
