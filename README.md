@@ -1,24 +1,23 @@
 # EdgeOn_Client
 
-English | [한국어](#한국어)
+한국어
 
-## English
+## 개요
 
-### Overview
-EdgeOn_Client is a Qt + OpenCV based multi-channel RTSP viewer.
-It is designed to display many streams at once with GPU-first decoding/rendering on Windows.
-This project is developed and built primarily with JetBrains CLion.
+EdgeOn_Client는 Qt + OpenCV 기반의 멀티 채널 RTSP 뷰어입니다.
+Windows 환경에서 GPU 우선 디코딩/렌더링 방식으로 여러 스트림을 동시에 표시하도록 설계되었습니다.
+이 프로젝트는 주로 JetBrains CLion 환경에서 개발 및 빌드됩니다.
 
-### Key Features
-- Up to 16 channels (4x4) in one window.
-- Multiple layout presets: 1x1, 2x2, 3x3, 4x4, 2x3, 3x2, focus-ring, and 3-large+4-small.
-- Per-channel worker thread for independent stream handling.
-- NVDEC-first decode path (`cv::cudacodec::VideoReader`) with automatic fallback to FFmpeg `VideoCapture`.
-- Auto reconnect when stream is disconnected.
-- Latest-frame-only queueing to keep UI responsive under high load.
-- Drag & drop stream assignment and stream move between cells.
+### 주요 기능
+- 하나의 창에서 최대 16채널(4x4) 동시 표시
+- 다양한 레이아웃 프리셋 지원: 1x1, 2x2, 3x3, 4x4, 2x3, 3x2, focus-ring, 3-large+4-small
+- 채널별 독립 스트림 처리를 위한 워커 스레드 구조
+- NVDEC 우선 디코딩 경로(`cv::cudacodec::VideoReader`)와 FFmpeg `VideoCapture` 자동 폴백
+- 스트림 끊김 시 자동 재연결
+- 고부하 상황에서도 UI 반응성을 유지하기 위한 최신 프레임 우선 큐잉
+- 드래그 앤 드롭 기반 스트림 할당 및 셀 간 스트림 이동
 
-### Tech Stack
+### 기술 스택
 - C++20
 - CMake
 - JetBrains CLion
@@ -27,39 +26,42 @@ This project is developed and built primarily with JetBrains CLion.
 - NVIDIA CUDA Toolkit 12.9
 - Windows: Direct2D/Direct3D11 for rendering path
 
-### Requirements
-- Windows 10/11 (primary target in current code)
+### 요구 사항
+- Windows 10/11(현재 코드의 주 대상 플랫폼)
 - Visual Studio 2022 (MSVC)
 - CMake 4.2+
 - CUDA Toolkit 12.9
-- Qt 6.11.0 (or compatible Qt6 with Widgets/Sql)
-- OpenCV 4.13 build with CUDA + FFmpeg support
-- Clion IDE (required for building because of CMake profiles)
+- Qt 6.11.0(또는 `Widgets`/`Sql`을 포함한 호환 Qt6)
+- CUDA + FFmpeg 지원으로 빌드된 OpenCV 4.13
+- CLion IDE(CMake 프로파일 기반 빌드 워크플로 때문에 필요)
 
 
-### Usage
-1. Launch the app.
-2. Add RTSP URLs from the left stream list panel.
-3. Double-click a URL to start in the first empty visible cell.
-4. Or drag a URL onto a specific cell.
-5. Right-click an active cell to remove its stream.
-6. Change grid/layout from the toolbar.
+### 사용 방법
+1. 앱을 실행합니다.
+2. 왼쪽 스트림 목록 패널에서 RTSP URL을 추가합니다.
+3. URL을 더블클릭하면 첫 번째 빈 가시 셀에서 재생이 시작됩니다.
+4. 또는 원하는 셀로 URL을 드래그 앤 드롭합니다.
+5. 활성 셀에서 오른쪽 클릭하여 해당 스트림을 제거할 수 있습니다.
+6. 툴바에서 그리드/레이아웃을 변경합니다.
 
-### Runtime Options
+### 런타임 옵션
 - `EDGEON_ENABLE_CUDA_D3D_INTEROP=0`
-  - Disables CUDA-D3D interop and uses fallback rendering path when needed.
+  - CUDA-D3D interop를 비활성화하고 필요 시 폴백 렌더링 경로를 사용합니다.
 
-### Project Structure
-- `main.cpp`: app entry point.
-- `mainwindow.h/.cpp`: main UI, layout presets, stream list, worker lifecycle.
-- `videocell.h/.cpp`: per-cell rendering, drag/drop interactions, status/FPS overlay.
-- `streamworker.h/.cpp`: stream ingest/decode thread (NVDEC + fallback).
-- `CMakeLists.txt`: dependencies, output/install layout, Windows deploy helper (`windeployqt`).
+### 프로젝트 구조
+- `main.cpp`: 애플리케이션 진입점
+- `mainwindow.h/.cpp`: 메인 UI, 레이아웃 프리셋, 스트림 목록, 워커 생명주기 관리
+- `videocell.h/.cpp`: 셀별 렌더링, 드래그/드롭 상호작용, 상태/FPS 오버레이
+- `streamworker.h/.cpp`: 스트림 수신/디코딩 스레드(NVDEC + 폴백)
+- `CMakeLists.txt`: 의존성, 출력/설치 레이아웃, Windows 배포 도우미(`windeployqt`)
 
-### Notes
-- `CMakeLists.txt` includes machine-specific OpenCV paths; adjust them before sharing with others.
-- Current implementation is optimized for Windows. Linux build files exist but may require extra validation and platform-specific rendering adjustments.
-- CLion CMake profiles are the primary workflow used during development.
+### 참고 사항
+- `CMakeLists.txt`에는 로컬 머신에 종속된 OpenCV 경로가 포함되어 있으므로, 다른 사람과 공유하기 전에 경로를 조정해야 합니다.
+- 현재 구현은 Windows에 최적화되어 있습니다. Linux용 빌드 파일도 존재하지만 추가 검증과 플랫폼별 렌더링 조정이 필요할 수 있습니다.
+- 개발 과정에서는 CLion의 CMake 프로파일을 기본 워크플로로 사용합니다.
 
-### License
+### 로드맵 / TODO
+- 우선순위가 정리된 개선 아이디어와 예정 기능은 [`TODO.md`](./TODO.md)에서 확인할 수 있습니다.
+
+### 라이선스
 MIT

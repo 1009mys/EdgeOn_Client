@@ -166,6 +166,8 @@ if(WIN32)
     else()
         message(WARNING "windeployqt not found: ${_windeployqt_executable}")
     endif()
+else()
+
 endif()
 
 if(NOT PROJECT_VERSION)

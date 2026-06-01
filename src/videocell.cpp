@@ -15,6 +15,7 @@
 #include <QHash>
 #include <QUrl>
 #include <QDebug>
+#include <QDateTime>
 #include <QtGlobal>
 #include <atomic>
 #include <opencv2/cudaimgproc.hpp>
@@ -44,7 +45,8 @@ bool isInteropDisabledByEnv() {
 }
 
 std::atomic<bool> g_gpuInteropGloballyDisabled{isInteropDisabledByEnv()};
-std::atomic<bool> g_gpuInteropDisableLogged{false};
+constexpr qint64 kInteropRetryBaseMs = 500;
+constexpr qint64 kInteropRetryMaxMs = 5000;
 
 QRectF aspectFitRect(const QSizeF& src, const QSizeF& dst) {
     if (src.isEmpty() || dst.isEmpty())
@@ -136,6 +138,8 @@ struct VideoCell::RenderState {
     int gpuFrameWidth{0};
     int gpuFrameHeight{0};
     bool gpuInteropDisabled{false};
+    int interopFailureCount{0};
+    qint64 interopRetryAtMs{0};
     ComPtr<ID2D1SolidColorBrush> activeBorderBrush;
     ComPtr<ID2D1SolidColorBrush> inactiveBorderBrush;
     ComPtr<ID2D1SolidColorBrush> dragBorderBrush;
@@ -190,6 +194,11 @@ void VideoCell::activate(const QString& url) {
         m_gpuFrame.release();
     }
     m_bitmapDirty = true;
+#ifdef Q_OS_WIN
+    // 이전 interop 실패 상태가 남아 있으면 스트림 시작 시 렌더 상태를 새로 만든다.
+    if (m_renderState && m_renderState->gpuInteropDisabled)
+        discardRenderResources();
+#endif
     setStatus("연결 중...");
     update();
 }
@@ -207,6 +216,10 @@ void VideoCell::deactivate() {
         m_gpuFrame.release();
     }
     m_bitmapDirty = true;
+#ifdef Q_OS_WIN
+    // 비활성화 시 렌더 상태를 정리해 셀 단위 고착 상태를 다음 재생으로 넘기지 않는다.
+    discardRenderResources();
+#endif
     setStatus(QString());
     update();
 }
@@ -404,13 +417,19 @@ void VideoCell::resizeEvent(QResizeEvent* ev) {
         if (m_renderState->d2dContext)
             m_renderState->d2dContext->SetTarget(nullptr);
         m_renderState->targetBitmap.Reset();
-        m_renderState->swapChain->ResizeBuffers(
+        const HRESULT hr = m_renderState->swapChain->ResizeBuffers(
             0,
             static_cast<UINT>(qMax(1, ev->size().width())),
             static_cast<UINT>(qMax(1, ev->size().height())),
             DXGI_FORMAT_B8G8R8A8_UNORM,
             0);
-        m_bitmapDirty = true;
+        if (FAILED(hr)) {
+            qWarning() << "[VideoCell][D3D] cell" << (m_cellId + 1)
+                       << "ResizeBuffers failed. Recreating render resources.";
+            discardRenderResources();
+        } else {
+            m_bitmapDirty = true;
+        }
     }
 #endif
     m_statusLabel->setGeometry(statusLabelRectFor(ev->size()));
@@ -450,10 +469,7 @@ void VideoCell::updateRenderBitmap() {
     auto disableInterop = [this]() {
         if (!m_renderState)
             return;
-        g_gpuInteropGloballyDisabled.store(true, std::memory_order_release);
-        if (!g_gpuInteropDisableLogged.exchange(true, std::memory_order_acq_rel)) {
-            qWarning() << "[VideoCell][Interop] CUDA-D3D interop disabled globally.";
-        }
+
         m_renderState->gpuInteropDisabled = true;
         if (m_renderState->cudaFrameResource) {
             cudaGraphicsUnregisterResource(m_renderState->cudaFrameResource);
@@ -464,11 +480,29 @@ void VideoCell::updateRenderBitmap() {
         m_renderState->gpuFrameSurface.Reset();
         m_renderState->gpuFrameWidth = 0;
         m_renderState->gpuFrameHeight = 0;
+
+        const int failures = ++m_renderState->interopFailureCount;
+        qint64 delayMs = kInteropRetryBaseMs;
+        for (int i = 1; i < failures && delayMs < kInteropRetryMaxMs; ++i)
+            delayMs = qMin(kInteropRetryMaxMs, delayMs * 2);
+
+        m_renderState->interopRetryAtMs = QDateTime::currentMSecsSinceEpoch() + delayMs;
+        qWarning() << "[VideoCell][Interop] cell" << (m_cellId + 1)
+                   << "interop temporarily disabled for" << delayMs << "ms.";
     };
+
+    const bool interopDisabledByEnv = g_gpuInteropGloballyDisabled.load(std::memory_order_acquire);
+    if (m_renderState->gpuInteropDisabled && !interopDisabledByEnv) {
+        if (QDateTime::currentMSecsSinceEpoch() >= m_renderState->interopRetryAtMs) {
+            m_renderState->gpuInteropDisabled = false;
+            qInfo() << "[VideoCell][Interop] cell" << (m_cellId + 1)
+                    << "retrying CUDA-D3D interop.";
+        }
+    }
 
     if (!gpuFrame.empty() && gpuFrame.type() == CV_8UC4 && m_renderState->d3dDevice &&
         !m_renderState->gpuInteropDisabled &&
-        !g_gpuInteropGloballyDisabled.load(std::memory_order_acquire)) {
+        !interopDisabledByEnv) {
         bool interopOk = true;
 
         const int width = gpuFrame.cols;
@@ -571,8 +605,11 @@ void VideoCell::updateRenderBitmap() {
             interopOk = false;
         }
 
-        if (interopOk)
+        if (interopOk) {
+            m_renderState->interopFailureCount = 0;
+            m_renderState->interopRetryAtMs = 0;
             return;
+        }
 
         // interop 실패 시 전역적으로 interop를 끈다.
         disableInterop();
@@ -580,7 +617,25 @@ void VideoCell::updateRenderBitmap() {
 
     m_renderState->frameBitmap.Reset();
 
-    if (m_frame.isNull())
+    QImage cpuFallbackFrame;
+    const QImage* sourceFrame = &m_frame;
+    if (sourceFrame->isNull() && !gpuFrame.empty() && gpuFrame.type() == CV_8UC4) {
+        cv::Mat cpuFrame;
+        gpuFrame.download(cpuFrame);
+        if (!cpuFrame.empty()) {
+            // GpuMat 메모리 생명주기와 분리하기 위해 copy()로 독립 버퍼를 만든다.
+            const QImage wrapped(
+                cpuFrame.data,
+                cpuFrame.cols,
+                cpuFrame.rows,
+                static_cast<qsizetype>(cpuFrame.step),
+                QImage::Format_ARGB32);
+            cpuFallbackFrame = wrapped.copy();
+            sourceFrame = &cpuFallbackFrame;
+        }
+    }
+
+    if (sourceFrame->isNull())
         return;
 
     ID2D1Bitmap1* bitmap = nullptr;
@@ -589,9 +644,9 @@ void VideoCell::updateRenderBitmap() {
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
 
     const HRESULT hr = m_renderState->d2dContext->CreateBitmap(
-        D2D1::SizeU(static_cast<UINT32>(m_frame.width()), static_cast<UINT32>(m_frame.height())),
-        m_frame.constBits(),
-        static_cast<UINT32>(m_frame.bytesPerLine()),
+        D2D1::SizeU(static_cast<UINT32>(sourceFrame->width()), static_cast<UINT32>(sourceFrame->height())),
+        sourceFrame->constBits(),
+        static_cast<UINT32>(sourceFrame->bytesPerLine()),
         props,
         &bitmap);
 
