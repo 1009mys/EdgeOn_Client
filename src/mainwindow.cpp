@@ -36,6 +36,13 @@
 #include <QMimeData>
 #include <QSignalBlocker>
 #include <QSettings>
+#include <QBrush>
+#include <QColor>
+#include <QCloseEvent>
+#include <QSystemTrayIcon>
+#include <QApplication>
+#include <QStyle>
+#include <QTimer>
 #include <opencv2/core/cuda.hpp>
 
 namespace {
@@ -45,7 +52,23 @@ constexpr int kCameraNameRole = Qt::UserRole + 2;
 constexpr int kCameraStreamTypeRole = Qt::UserRole + 3;
 constexpr int kCameraEnabledRole = Qt::UserRole + 4;
 constexpr int kCameraUrlRole = Qt::UserRole + 5;
+constexpr int kCameraRecordEnabledRole = Qt::UserRole + 6;
 constexpr const char* kCameraFormExpandedSetting = "ui/streamList/cameraFormExpanded";
+constexpr const char* kRecordAutoDecodeSetting = "stream/recordAutoDecodeEnabled";
+constexpr const char* kCameraIdMime = "application/x-edgeon-camera-id";
+constexpr const char* kRecordOutputRoot = "E:/EdgeOn";
+constexpr int kRecordSegmentSeconds = 30;
+constexpr const char* kRecordSegmentSecondsSetting = "record/segmentSeconds";
+
+int effectiveRecordSegmentSeconds() {
+    QSettings settings;
+    return qMax(1, settings.value(kRecordSegmentSecondsSetting, kRecordSegmentSeconds).toInt());
+}
+
+void syncRecordButtonText(QPushButton* button, bool enabled) {
+    if (!button) return;
+    button->setText(enabled ? "REC ON" : "REC OFF");
+}
 
 QString streamTypeToText(StreamType type) {
     switch (type) {
@@ -56,21 +79,23 @@ QString streamTypeToText(StreamType type) {
 }
 
 QString makeCameraTooltip(const camera_info& camera) {
-    return QString("camera_id: %1\nname: %2\nstream_type: %3\nenabled: %4\nurl: %5")
+    return QString("camera_id: %1\nname: %2\nstream_type: %3\nenabled: %4\nrecord_enabled: %5\nurl: %6")
         .arg(camera.camera_id)
         .arg(QString::fromStdString(camera.name))
         .arg(streamTypeToText(camera.stream_type))
         .arg(camera.enabled ? "true" : "false")
+        .arg(camera.record_enabled ? "true" : "false")
         .arg(QString::fromStdString(camera.url));
 }
 
 QString makeCameraDisplayText(const camera_info& camera) {
     const QString name = QString::fromStdString(camera.name).trimmed();
     const QString url = QString::fromStdString(camera.url).trimmed();
+    const QString recBadge = camera.record_enabled ? " [REC]" : "";
     if (name.isEmpty() || name == url) {
-        return url;
+        return url + recBadge;
     }
-    return QString("%1 (%2)").arg(name, url);
+    return QString("%1 (%2)%3").arg(name, url, recBadge);
 }
 
 bool listHasUrl(const QListWidget* list, const QString& url) {
@@ -165,6 +190,13 @@ bool parseCameraCsvLine(const QString& line, camera_info& camera) {
         return false;
     }
 
+    bool recordEnabled = false;
+    if (cols.size() >= 6 && !cols[5].trimmed().isEmpty()) {
+        if (!parseEnabledValue(cols[5], recordEnabled)) {
+            return false;
+        }
+    }
+
     const QString url = cols[2].trimmed();
     if (url.isEmpty()) {
         return false;
@@ -181,6 +213,7 @@ bool parseCameraCsvLine(const QString& line, camera_info& camera) {
     camera.stream_type = type;
     camera.url = url.toStdString();
     camera.enabled = enabled;
+    camera.record_enabled = recordEnabled;
     return true;
 }
 
@@ -202,6 +235,10 @@ protected:
 
         auto* mime = new QMimeData();
         mime->setText(url);
+        const int cameraId = item->data(kCameraIdRole).toInt();
+        if (cameraId > 0) {
+            mime->setData(kCameraIdMime, QByteArray::number(cameraId));
+        }
         auto* drag = new QDrag(this);
         drag->setMimeData(mime);
         drag->exec(supportedActions, Qt::CopyAction);
@@ -212,17 +249,33 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildUi();
     setWindowTitle("RTSP 멀티채널 뷰어");
     resize(1600, 900);
+    setupSystemTray();
 }
 
 MainWindow::~MainWindow() {
-    // MainWindow 종료 시점에는 워커를 동기 정리해 QThread 파괴 경쟁을 피한다.
-    const auto workers = m_workers;
-    m_workers.clear();
-    for (auto* w : workers) {
-        disconnect(w, nullptr, this, nullptr);
-        w->stop();
-        w->wait(5000);
-        delete w;
+    shutdownAllSessions();
+    if (m_trayIcon) {
+        m_trayIcon->hide();
+    }
+}
+
+void MainWindow::closeEvent(QCloseEvent* event)
+{
+    if (m_allowClose || !m_trayEnabled || !m_trayIcon || !m_trayIcon->isVisible()) {
+        QMainWindow::closeEvent(event);
+        return;
+    }
+
+    event->ignore();
+    hide();
+
+    if (!m_trayNoticeShown) {
+        m_trayNoticeShown = true;
+        m_trayIcon->showMessage(
+            "RTSP 멀티채널 뷰어",
+            "프로그램이 시스템 트레이로 최소화되었습니다. 종료는 트레이 메뉴의 '종료'를 사용하세요.",
+            QSystemTrayIcon::Information,
+            3000);
     }
 }
 
@@ -247,6 +300,7 @@ void MainWindow::buildUi() {
     for (int i = 0; i < TOTAL; ++i) {
         auto* cell = new VideoCell(i, m_central);
         connect(cell, &VideoCell::addRequested,    this, &MainWindow::onAddRequested);
+        connect(cell, &VideoCell::addRequestedByCamera, this, &MainWindow::onAddRequestedByCamera);
         connect(cell, &VideoCell::moveRequested,   this, &MainWindow::onMoveRequested);
         connect(cell, &VideoCell::removeRequested, this, &MainWindow::onRemoveRequested);
         m_cells[i] = cell;
@@ -329,6 +383,18 @@ void MainWindow::buildStreamListPanel() {
     m_enabledInput = new QCheckBox("활성", panel);
     m_enabledInput->setChecked(true);
 
+    m_recordEnabledButton = new QPushButton(panel);
+    m_recordEnabledButton->setCheckable(true);
+    m_recordEnabledButton->setChecked(false);
+    syncRecordButtonText(m_recordEnabledButton, false);
+
+    m_recordAutoDecodeInput = new QCheckBox("녹화 시 자동 디코딩", panel);
+    {
+        QSettings settings;
+        m_recordAutoDecodeEnabled = settings.value(kRecordAutoDecodeSetting, true).toBool();
+    }
+    m_recordAutoDecodeInput->setChecked(m_recordAutoDecodeEnabled);
+
     auto* form = new QFormLayout();
     form->setContentsMargins(0, 0, 0, 0);
     form->setSpacing(4);
@@ -337,6 +403,61 @@ void MainWindow::buildStreamListPanel() {
     form->addRow("스트림 타입", m_streamTypeInput);
     form->addRow("URL", m_streamInput);
     form->addRow("상태", m_enabledInput);
+    form->addRow("녹화", m_recordEnabledButton);
+    form->addRow("동작", m_recordAutoDecodeInput);
+
+    connect(m_recordEnabledButton, &QPushButton::toggled, this, [this](bool checked) {
+        syncRecordButtonText(m_recordEnabledButton, checked);
+        if (!m_streamList) return;
+
+        auto* item = m_streamList->currentItem();
+        if (!item) return;
+
+        const int cameraId = item->data(kCameraIdRole).toInt();
+        if (cameraId <= 0) return;
+
+        const auto cameraResult = DBManager::instance().getCameraByCameraId(cameraId);
+        if (!cameraResult) {
+            QMessageBox::warning(this, "DB 오류", "카메라 조회 실패:\n" + cameraResult.error());
+            return;
+        }
+
+        camera_info camera = cameraResult.value();
+        camera.record_enabled = checked;
+        const auto updateResult = DBManager::instance().updateCameraByCameraId(camera);
+        if (!updateResult) {
+            QMessageBox::warning(this, "DB 오류", "녹화 상태 저장 실패:\n" + updateResult.error());
+            return;
+        }
+
+        item->setText(makeCameraDisplayText(camera));
+        item->setData(kCameraRecordEnabledRole, checked);
+        item->setToolTip(makeCameraTooltip(camera));
+        updateCameraItemVisualState(item);
+        setCameraRecordingRequested(cameraId, checked);
+    });
+
+    connect(m_recordAutoDecodeInput, &QCheckBox::toggled, this, [this](bool checked) {
+        m_recordAutoDecodeEnabled = checked;
+        QSettings settings;
+        settings.setValue(kRecordAutoDecodeSetting, checked);
+        settings.sync();
+
+        if (!m_streamList) {
+            return;
+        }
+
+        for (int i = 0; i < m_streamList->count(); ++i) {
+            auto* item = m_streamList->item(i);
+            if (!item) continue;
+
+            const int cameraId = item->data(kCameraIdRole).toInt();
+            if (cameraId <= 0) continue;
+
+            const bool recordEnabled = item->data(kCameraRecordEnabledRole).toBool();
+            setCameraRecordingRequested(cameraId, recordEnabled);
+        }
+    });
 
     auto* addBtn = new QPushButton("추가", panel);
     auto* editBtn = new QPushButton("수정", panel);
@@ -391,7 +512,7 @@ void MainWindow::buildStreamListPanel() {
     // 선택한 항목을 인라인 입력 폼으로 가져와 수정 흐름을 단순화
     connect(m_streamList, &QListWidget::currentItemChanged,
             this, [this](QListWidgetItem* current, QListWidgetItem*) {
-                if (!m_cameraIdInput || !m_nameInput || !m_streamTypeInput || !m_streamInput || !m_enabledInput)
+                if (!m_cameraIdInput || !m_nameInput || !m_streamTypeInput || !m_streamInput || !m_enabledInput || !m_recordEnabledButton)
                     return;
                 if (!current) {
                     resetInlineCameraForm(false);
@@ -411,6 +532,12 @@ void MainWindow::buildStreamListPanel() {
                                         : current->data(kCameraUrlRole).toString().trimmed();
                 m_streamInput->setText(url);
                 m_enabledInput->setChecked(current->data(kCameraEnabledRole).toBool());
+                const bool recordEnabled = current->data(kCameraRecordEnabledRole).toBool();
+                {
+                    const QSignalBlocker blocker(m_recordEnabledButton);
+                    m_recordEnabledButton->setChecked(recordEnabled);
+                }
+                syncRecordButtonText(m_recordEnabledButton, recordEnabled);
             });
 
     vbox->addWidget(foldButton);
@@ -422,6 +549,107 @@ void MainWindow::buildStreamListPanel() {
     addDockWidget(Qt::LeftDockWidgetArea, m_streamDock);
 
     loadCameraListFromDB();
+}
+
+void MainWindow::setupSystemTray()
+{
+    if (!QSystemTrayIcon::isSystemTrayAvailable()) {
+        m_trayEnabled = false;
+        QMessageBox::warning(
+            this,
+            "시스템 트레이 미지원",
+            "현재 환경에서 시스템 트레이를 사용할 수 없습니다.\n"
+            "창 닫기(X)는 프로그램 종료로 동작합니다.");
+        return;
+    }
+
+    m_trayIcon = new QSystemTrayIcon(this);
+    QIcon icon = QApplication::windowIcon();
+    if (icon.isNull()) {
+        icon = windowIcon();
+    }
+    if (icon.isNull()) {
+        icon = style()->standardIcon(QStyle::SP_ComputerIcon);
+    }
+    if (!icon.isNull()) {
+        setWindowIcon(icon);
+    }
+    m_trayIcon->setIcon(icon);
+    m_trayIcon->setToolTip("RTSP 멀티채널 뷰어");
+
+    auto* trayMenu = new QMenu(this);
+    m_showAction = trayMenu->addAction("열기");
+    m_quitAction = trayMenu->addAction("종료");
+
+    connect(m_showAction, &QAction::triggered, this, &MainWindow::showFromTray);
+    connect(m_quitAction, &QAction::triggered, this, &MainWindow::quitFromTray);
+    connect(m_trayIcon, &QSystemTrayIcon::activated, this,
+            [this](QSystemTrayIcon::ActivationReason reason) {
+                if (reason == QSystemTrayIcon::Trigger ||
+                    reason == QSystemTrayIcon::DoubleClick) {
+                    showFromTray();
+                }
+            });
+
+    m_trayIcon->setContextMenu(trayMenu);
+    m_trayIcon->show();
+    m_trayEnabled = m_trayIcon->isVisible();
+
+    if (!m_trayEnabled) {
+        QTimer::singleShot(300, this, [this]() {
+            if (!m_trayIcon || m_trayIcon->isVisible()) {
+                m_trayEnabled = m_trayIcon && m_trayIcon->isVisible();
+                return;
+            }
+
+            m_trayIcon->show();
+            m_trayEnabled = m_trayIcon->isVisible();
+            if (!m_trayEnabled) {
+                QMessageBox::warning(
+                    this,
+                    "시스템 트레이 표시 실패",
+                    "시스템 트레이 아이콘을 표시하지 못했습니다.\n"
+                    "창 닫기(X)는 프로그램 종료로 동작합니다.");
+            }
+        });
+    }
+}
+
+void MainWindow::showFromTray()
+{
+    showNormal();
+    raise();
+    activateWindow();
+}
+
+void MainWindow::quitFromTray()
+{
+    if (m_isShuttingDown) {
+        return;
+    }
+
+    m_isShuttingDown = true;
+    m_allowClose = true;
+    if (m_trayIcon) {
+        m_trayIcon->hide();
+    }
+    m_trayEnabled = false;
+
+    shutdownAllSessions();
+    QCoreApplication::quit();
+}
+
+void MainWindow::shutdownAllSessions()
+{
+    // 종료 경로에서는 모든 워커가 완전히 끝날 때까지 기다려 QThread 파괴 경고를 방지한다.
+    const auto cameraIds = m_sessions.keys();
+    for (const int cameraId : cameraIds) {
+        if (auto* session = findSession(cameraId)) {
+            stopAndDeleteSession(*session);
+        }
+    }
+    m_sessions.clear();
+    m_cellToCamera.clear();
 }
 
 void MainWindow::addLayoutPresetAction(QMenu* menu, const QString& text, int rows, int cols) {
@@ -529,55 +757,93 @@ void MainWindow::onAddRequested(int cellId, const QString& url) {
     addStream(cellId, url);
 }
 
+void MainWindow::onAddRequestedByCamera(int cellId, int cameraId, const QString& url) {
+    addStreamByCamera(cellId, cameraId, url);
+}
+
 void MainWindow::onMoveRequested(int fromCellId, int toCellId) {
     if (fromCellId < 0 || fromCellId >= TOTAL || toCellId < 0 || toCellId >= TOTAL)
         return;
     if (fromCellId == toCellId)
         return;
 
-    QString url;
-    if (m_workers.contains(fromCellId)) {
-        url = m_workers[fromCellId]->url();
-    } else {
-        url = m_cells[fromCellId]->streamUrl();
+    const int sourceCameraId = m_cellToCamera.value(fromCellId, 0);
+    QString url = m_cells[fromCellId]->streamUrl();
+    if (sourceCameraId != 0) {
+        if (const auto* session = findSession(sourceCameraId)) {
+            if (!session->url.trimmed().isEmpty()) {
+                url = session->url;
+            }
+        }
     }
 
     if (url.trimmed().isEmpty())
         return;
 
-    if (m_workers.contains(toCellId))
-        removeStream(toCellId);
-    if (m_workers.contains(fromCellId))
-        removeStream(fromCellId);
+    if (m_cellToCamera.contains(toCellId)) removeStream(toCellId);
+    if (m_cellToCamera.contains(fromCellId)) removeStream(fromCellId);
 
-    addStream(toCellId, url);
+    addStreamByCamera(toCellId, sourceCameraId, url);
 }
 
 void MainWindow::onRemoveRequested(int cellId) {
     removeStream(cellId);
 }
 
-void MainWindow::onFrameReady(int cellId) {
-    if (cellId < 0 || cellId >= TOTAL) return;
-    if (!m_workers.contains(cellId)) return;
-    if (sender() != m_workers.value(cellId)) return;
+void MainWindow::onFrameReady(int cameraId) {
+    auto* session = findSession(cameraId);
+    if (!session || !session->worker) return;
+    if (sender() != session->worker) return;
 
     cv::cuda::GpuMat gpuFrame;
-    if (m_workers[cellId]->takeLatestGpuFrame(gpuFrame)) {
-        m_cells[cellId]->updateGpuFrame(gpuFrame);
+    if (session->worker->takeLatestGpuFrame(gpuFrame)) {
+        for (const int cellId : session->attachedCells) {
+            if (cellId >= 0 && cellId < TOTAL) {
+                m_cells[cellId]->updateGpuFrame(gpuFrame);
+            }
+        }
         return;
     }
 
     QImage frame;
-    if (m_workers[cellId]->takeLatestFrame(frame))
-        m_cells[cellId]->updateFrame(frame);
+    if (session->worker->takeLatestFrame(frame)) {
+        for (const int cellId : session->attachedCells) {
+            if (cellId >= 0 && cellId < TOTAL) {
+                m_cells[cellId]->updateFrame(frame);
+            }
+        }
+    }
 }
 
-void MainWindow::onStatusChanged(int cellId, const QString& status) {
-    if (cellId < 0 || cellId >= TOTAL) return;
-    if (!m_workers.contains(cellId)) return;
-    if (sender() != m_workers.value(cellId)) return;
-    m_cells[cellId]->setStatus(status);
+void MainWindow::onStatusChanged(int cameraId, const QString& status) {
+    auto* session = findSession(cameraId);
+    if (!session || !session->worker) return;
+    if (sender() != session->worker) return;
+
+    session->lastStatus = status;
+    for (const int cellId : session->attachedCells) {
+        if (cellId >= 0 && cellId < TOTAL) {
+            m_cells[cellId]->setStatus(status);
+        }
+    }
+}
+
+void MainWindow::onRecorderStatusChanged(int cameraId, const QString& status)
+{
+    auto* session = findSession(cameraId);
+    if (!session || !session->recorder) return;
+    if (sender() != session->recorder) return;
+
+    session->lastStatus = status;
+
+    // 디코딩 세션이 없는 녹화 전용 상태에서만 셀 상태 텍스트를 갱신한다.
+    if (!session->worker) {
+        for (const int cellId : session->attachedCells) {
+            if (cellId >= 0 && cellId < TOTAL) {
+                m_cells[cellId]->setStatus(status);
+            }
+        }
+    }
 }
 
 void MainWindow::addStreamAddress() {
@@ -590,6 +856,7 @@ void MainWindow::addStreamAddress() {
     camera.stream_type = static_cast<StreamType>(m_streamTypeInput->currentData().toInt());
     camera.url = m_streamInput->text().trimmed().toStdString();
     camera.enabled = m_enabledInput->isChecked();
+    camera.record_enabled = m_recordEnabledButton && m_recordEnabledButton->isChecked();
 
     if (QString::fromStdString(camera.url).trimmed().isEmpty()) {
         QMessageBox::warning(this, "입력 오류", "URL은 비어 있을 수 없습니다.");
@@ -610,7 +877,7 @@ void MainWindow::addStreamAddress() {
 
 void MainWindow::updateSelectedStreamAddress()
 {
-    if (!m_streamList || !m_cameraIdInput || !m_nameInput || !m_streamTypeInput || !m_streamInput || !m_enabledInput)
+    if (!m_streamList || !m_cameraIdInput || !m_nameInput || !m_streamTypeInput || !m_streamInput || !m_enabledInput || !m_recordEnabledButton)
         return;
 
     auto* item = m_streamList->currentItem();
@@ -628,6 +895,7 @@ void MainWindow::updateSelectedStreamAddress()
     camera.stream_type = static_cast<StreamType>(m_streamTypeInput->currentData().toInt());
     camera.url = m_streamInput->text().trimmed().toStdString();
     camera.enabled = m_enabledInput->isChecked();
+    camera.record_enabled = m_recordEnabledButton->isChecked();
 
     if (QString::fromStdString(camera.url).trimmed().isEmpty()) {
         QMessageBox::warning(this, "입력 오류", "URL은 비어 있을 수 없습니다.");
@@ -669,8 +937,16 @@ void MainWindow::updateSelectedStreamAddress()
     item->setData(kCameraNameRole, QString::fromStdString(camera.name));
     item->setData(kCameraStreamTypeRole, static_cast<int>(camera.stream_type));
     item->setData(kCameraEnabledRole, camera.enabled);
+    item->setData(kCameraRecordEnabledRole, camera.record_enabled);
     item->setData(kCameraUrlRole, QString::fromStdString(camera.url));
     item->setToolTip(makeCameraTooltip(camera));
+    updateCameraItemVisualState(item);
+
+    if (camera.camera_id != oldCameraId) {
+        setCameraRecordingRequested(oldCameraId, false);
+    }
+    setCameraRecordingRequested(camera.camera_id, camera.record_enabled);
+
     m_nextCameraId = qMax(m_nextCameraId, camera.camera_id + 1);
     m_streamInput->setText(QString::fromStdString(camera.url));
 }
@@ -689,6 +965,7 @@ void MainWindow::removeSelectedStreamAddress() {
             QMessageBox::warning(this, "DB 오류", "카메라 삭제 실패:\n" + deleteResult.error());
             return;
         }
+        setCameraRecordingRequested(cameraId, false);
     }
 
     delete m_streamList->takeItem(row);
@@ -697,6 +974,7 @@ void MainWindow::removeSelectedStreamAddress() {
 
 void MainWindow::onStreamListDoubleClicked(QListWidgetItem* item) {
     if (!item) return;
+    const int cameraId = item->data(kCameraIdRole).toInt();
     const QString url = item->data(kCameraUrlRole).toString().trimmed().isEmpty()
                             ? item->text().trimmed()
                             : item->data(kCameraUrlRole).toString().trimmed();
@@ -705,7 +983,7 @@ void MainWindow::onStreamListDoubleClicked(QListWidgetItem* item) {
     // 표시 중인 슬롯 중 첫 번째 빈 칸에 스트림을 시작한다.
     for (int i = 0; i < m_visibleSlotCount; ++i) {
         if (!m_cells[i]->isActive()) {
-            addStream(i, url);
+            addStreamByCamera(i, cameraId, url);
             return;
         }
     }
@@ -784,6 +1062,7 @@ void MainWindow::loadUrlsFromFile() {
             camera.stream_type = StreamType::RTSP;
             camera.url = line.toStdString();
             camera.enabled = true;
+            camera.record_enabled = false;
         }
 
         const QString cameraUrl = QString::fromStdString(camera.url);
@@ -821,58 +1100,303 @@ void MainWindow::loadUrlsFromFile() {
 }
 
 void MainWindow::removeAllStreams() {
-    const auto ids = m_workers.keys();
-    for (int id : ids) removeStream(id);
+    const auto cellIds = m_cellToCamera.keys();
+    for (const int cellId : cellIds) removeStream(cellId);
 }
 
 // ── 스트림 추가/제거 ─────────────────────────────────────────
 
 void MainWindow::addStream(int cellId, const QString& url) {
-    // 기존 스트림이 있으면 먼저 제거
-    if (m_workers.contains(cellId))
-        removeStream(cellId);
+    if (cellId < 0 || cellId >= TOTAL) return;
+    const QString normalizedUrl = url.trimmed();
+    if (normalizedUrl.isEmpty()) return;
 
-    m_cells[cellId]->activate(url);
+    const int cameraId = resolveOrCreateCameraId(normalizedUrl);
+    if (cameraId == 0) return;
 
-    auto* worker = new StreamWorker(cellId, url, this);
-    connect(worker, &StreamWorker::frameReady,
-            this,   &MainWindow::onFrameReady,    Qt::QueuedConnection);
-    connect(worker, &StreamWorker::statusChanged,
-            this,   &MainWindow::onStatusChanged, Qt::QueuedConnection);
+    addStreamByCamera(cellId, cameraId, normalizedUrl);
+}
 
-    m_workers[cellId] = worker;
-    worker->start();
+void MainWindow::addStreamByCamera(int cellId, int cameraId, const QString& url)
+{
+    if (cellId < 0 || cellId >= TOTAL) return;
+    if (cameraId == 0) return;
+    const QString normalizedUrl = url.trimmed();
+    if (normalizedUrl.isEmpty()) return;
+
+    bindCellToCamera(cellId, cameraId, normalizedUrl);
     updateStatusBar();
 }
 
 void MainWindow::removeStream(int cellId) {
-    if (!m_workers.contains(cellId)) return;
-
-    auto* worker = m_workers.take(cellId);
-    disconnect(worker, nullptr, this, nullptr);
-    worker->stop();
-
-    // 실행 중이면 종료 후 GUI 스레드에서 안전하게 삭제한다.
-    if (worker->isRunning()) {
-        connect(worker, &QThread::finished, worker, &QObject::deleteLater);
-    } else {
-        delete worker;
-    }
-
-    m_cells[cellId]->deactivate();
+    if (cellId < 0 || cellId >= TOTAL) return;
+    unbindCell(cellId);
     updateStatusBar();
 }
 
 void MainWindow::updateStatusBar() {
-    const int active = static_cast<int>(m_workers.size());
+    const int active = static_cast<int>(m_sessions.size());
     setWindowTitle(QString("RTSP 멀티채널 뷰어  ─  %1  |  활성 %2 / %3")
                        .arg(m_layoutName)
                        .arg(active).arg(TOTAL));
-    m_statusLabel->setText(
-        QString("레이아웃: %1 (표시 %2칸)  |  활성 스트림: %3 / %4")
-            .arg(m_layoutName)
-            .arg(m_visibleSlotCount)
-                       .arg(active).arg(TOTAL));
+    if (m_statusLabel) {
+        m_statusLabel->setText(
+            QString("레이아웃: %1 (표시 %2칸)  |  활성 세션: %3 / %4")
+                .arg(m_layoutName)
+                .arg(m_visibleSlotCount)
+                           .arg(active).arg(TOTAL));
+    }
+}
+
+int MainWindow::resolveOrCreateCameraId(const QString& url)
+{
+    const QString normalizedUrl = url.trimmed();
+    if (normalizedUrl.isEmpty()) return 0;
+
+    if (m_streamList) {
+        for (int i = 0; i < m_streamList->count(); ++i) {
+            const auto* item = m_streamList->item(i);
+            if (!item) continue;
+
+            const QString itemUrl = item->data(kCameraUrlRole).toString().trimmed().isEmpty()
+                                        ? item->text().trimmed()
+                                        : item->data(kCameraUrlRole).toString().trimmed();
+            if (itemUrl != normalizedUrl) continue;
+
+            const int cameraId = item->data(kCameraIdRole).toInt();
+            if (cameraId > 0) {
+                return cameraId;
+            }
+        }
+    }
+
+    if (m_ephemeralCameraIds.contains(normalizedUrl)) {
+        return m_ephemeralCameraIds.value(normalizedUrl);
+    }
+
+    const int ephemeralCameraId = m_nextEphemeralCameraId--;
+    m_ephemeralCameraIds.insert(normalizedUrl, ephemeralCameraId);
+    return ephemeralCameraId;
+}
+
+void MainWindow::bindCellToCamera(int cellId, int cameraId, const QString& url)
+{
+    if (cellId < 0 || cellId >= TOTAL || cameraId == 0) return;
+
+    // 기존 바인딩은 먼저 해제해 셀당 세션 1개 규칙을 유지한다.
+    unbindCell(cellId);
+
+    auto sessionIt = m_sessions.find(cameraId);
+    if (sessionIt == m_sessions.end()) {
+        StreamSession session;
+        session.cameraId = cameraId;
+        session.url = url;
+        if (cameraId > 0) {
+            const auto cameraResult = DBManager::instance().getCameraByCameraId(cameraId);
+            if (cameraResult) {
+                const auto& camera = cameraResult.value();
+                session.url = QString::fromStdString(camera.url).trimmed();
+                session.recordRequested = camera.record_enabled;
+            }
+        }
+        m_sessions.insert(cameraId, session);
+        sessionIt = m_sessions.find(cameraId);
+    }
+
+    auto& session = sessionIt.value();
+    if (session.url.isEmpty()) {
+        session.url = url;
+    }
+
+    m_cellToCamera.insert(cellId, cameraId);
+    session.attachedCells.insert(cellId);
+
+    m_cells[cellId]->activate(session.url);
+    if (!session.lastStatus.trimmed().isEmpty()) {
+        m_cells[cellId]->setStatus(session.lastStatus);
+    }
+    syncSessionLifetime(cameraId);
+
+    // 이미 디코딩 중인 세션이라면 bind 직후 최신 프레임을 한 번 가져와 즉시 표시를 시도한다.
+    if (session.worker) {
+        cv::cuda::GpuMat gpuFrame;
+        if (session.worker->takeLatestGpuFrame(gpuFrame)) {
+            m_cells[cellId]->updateGpuFrame(gpuFrame);
+        } else {
+            QImage frame;
+            if (session.worker->takeLatestFrame(frame)) {
+                m_cells[cellId]->updateFrame(frame);
+            }
+        }
+    }
+}
+
+void MainWindow::unbindCell(int cellId)
+{
+    const auto bindingIt = m_cellToCamera.find(cellId);
+    if (bindingIt == m_cellToCamera.end()) {
+        if (cellId >= 0 && cellId < TOTAL) {
+            m_cells[cellId]->deactivate();
+        }
+        return;
+    }
+
+    const int cameraId = bindingIt.value();
+    m_cellToCamera.erase(bindingIt);
+
+    auto sessionIt = m_sessions.find(cameraId);
+    if (sessionIt != m_sessions.end()) {
+        sessionIt->attachedCells.remove(cellId);
+    }
+
+    if (cellId >= 0 && cellId < TOTAL) {
+        m_cells[cellId]->deactivate();
+    }
+
+    syncSessionLifetime(cameraId);
+}
+
+void MainWindow::setCameraRecordingRequested(int cameraId, bool requested)
+{
+    if (cameraId == 0) return;
+
+    auto sessionIt = m_sessions.find(cameraId);
+    if (sessionIt == m_sessions.end()) {
+        if (!requested) return;
+
+        StreamSession session;
+        session.cameraId = cameraId;
+
+        const auto cameraResult = DBManager::instance().getCameraByCameraId(cameraId);
+        if (cameraResult) {
+            session.url = QString::fromStdString(cameraResult.value().url).trimmed();
+        }
+        session.recordRequested = true;
+        m_sessions.insert(cameraId, session);
+    } else {
+        sessionIt->recordRequested = requested;
+    }
+
+    syncSessionLifetime(cameraId);
+    updateStatusBar();
+}
+
+void MainWindow::syncSessionLifetime(int cameraId)
+{
+    auto* session = findSession(cameraId);
+    if (!session) return;
+
+    const QString streamUrl = session->url.trimmed();
+    const bool shouldRecord = session->recordRequested;
+    const bool shouldDecode =
+        !session->attachedCells.isEmpty() || (shouldRecord && m_recordAutoDecodeEnabled);
+
+    if (!shouldDecode && session->worker) {
+        auto* worker = session->worker;
+        session->worker = nullptr;
+        disconnect(worker, nullptr, this, nullptr);
+        worker->stop();
+        if (worker->isRunning()) {
+            worker->wait(5000);
+        }
+        if (worker->isRunning()) {
+            worker->wait();
+        }
+        delete worker;
+    }
+
+    if (!shouldRecord && session->recorder) {
+        auto* recorder = session->recorder;
+        session->recorder = nullptr;
+        disconnect(recorder, nullptr, this, nullptr);
+        recorder->stop();
+        if (recorder->isRunning()) {
+            recorder->wait(5000);
+        }
+        if (recorder->isRunning()) {
+            recorder->wait();
+        }
+        delete recorder;
+    }
+
+    if (streamUrl.isEmpty()) {
+        if (!shouldRecord && !shouldDecode && session->attachedCells.isEmpty()) {
+            m_sessions.remove(cameraId);
+        }
+        return;
+    }
+
+    if (shouldDecode && !session->worker) {
+        session->worker = new StreamWorker(cameraId, streamUrl, this);
+        connect(session->worker, &StreamWorker::frameReady,
+                this, &MainWindow::onFrameReady, Qt::QueuedConnection);
+        connect(session->worker, &StreamWorker::statusChanged,
+                this, &MainWindow::onStatusChanged, Qt::QueuedConnection);
+        session->worker->start();
+    }
+
+    if (shouldRecord && !session->recorder) {
+        const int segmentSeconds = effectiveRecordSegmentSeconds();
+        session->recorder = new RecorderWorker(cameraId,
+                                               streamUrl,
+                                               QString::fromUtf8(kRecordOutputRoot),
+                                               segmentSeconds,
+                                               this);
+        connect(session->recorder, &RecorderWorker::statusChanged,
+                this, &MainWindow::onRecorderStatusChanged, Qt::QueuedConnection);
+        session->recorder->start();
+    }
+
+    if (!shouldRecord && !shouldDecode && session->attachedCells.isEmpty()) {
+        m_sessions.remove(cameraId);
+    }
+}
+
+void MainWindow::stopAndDeleteSession(StreamSession& session)
+{
+    if (session.worker) {
+        auto* worker = session.worker;
+        session.worker = nullptr;
+
+        disconnect(worker, nullptr, this, nullptr);
+        worker->stop();
+        if (worker->isRunning()) {
+            worker->wait(5000);
+        }
+        if (worker->isRunning()) {
+            worker->wait();
+        }
+        delete worker;
+    }
+
+    if (session.recorder) {
+        auto* recorder = session.recorder;
+        session.recorder = nullptr;
+
+        disconnect(recorder, nullptr, this, nullptr);
+        recorder->stop();
+        if (recorder->isRunning()) {
+            recorder->wait(5000);
+        }
+        if (recorder->isRunning()) {
+            recorder->wait();
+        }
+        delete recorder;
+    }
+}
+
+MainWindow::StreamSession* MainWindow::findSession(int cameraId)
+{
+    const auto it = m_sessions.find(cameraId);
+    if (it == m_sessions.end()) return nullptr;
+    return &it.value();
+}
+
+const MainWindow::StreamSession* MainWindow::findSession(int cameraId) const
+{
+    const auto it = m_sessions.constFind(cameraId);
+    if (it == m_sessions.cend()) return nullptr;
+    return &it.value();
 }
 
 void MainWindow::loadCameraListFromDB()
@@ -924,8 +1448,30 @@ void MainWindow::addCameraListItem(const camera_info& camera)
     item->setData(kCameraNameRole, QString::fromStdString(camera.name));
     item->setData(kCameraStreamTypeRole, static_cast<int>(camera.stream_type));
     item->setData(kCameraEnabledRole, camera.enabled);
+    item->setData(kCameraRecordEnabledRole, camera.record_enabled);
     item->setData(kCameraUrlRole, url);
     item->setToolTip(makeCameraTooltip(camera));
+    updateCameraItemVisualState(item);
+
+    // 셀이 없어도 녹화가 켜진 카메라는 세션 수명주기에서 유지될 수 있게 즉시 반영한다.
+    if (camera.record_enabled) {
+        setCameraRecordingRequested(camera.camera_id, true);
+    }
+}
+
+void MainWindow::updateCameraItemVisualState(QListWidgetItem* item)
+{
+    if (!item) return;
+
+    const bool recordEnabled = item->data(kCameraRecordEnabledRole).toBool();
+    if (recordEnabled) {
+        item->setBackground(QColor(255, 230, 230));
+        item->setForeground(QColor(180, 20, 20));
+        return;
+    }
+
+    item->setBackground(QBrush());
+    item->setForeground(QBrush());
 }
 
 void MainWindow::resetInlineCameraForm(bool clearSelection)
@@ -949,6 +1495,11 @@ void MainWindow::resetInlineCameraForm(bool clearSelection)
     }
     if (m_enabledInput) {
         m_enabledInput->setChecked(true);
+    }
+    if (m_recordEnabledButton) {
+        const QSignalBlocker blocker(m_recordEnabledButton);
+        m_recordEnabledButton->setChecked(false);
+        syncRecordButtonText(m_recordEnabledButton, false);
     }
 }
 

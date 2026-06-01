@@ -15,6 +15,7 @@ camera_info parseCameraRow(const QSqlQuery& query)
     camera.stream_type = static_cast<StreamType>(query.value(3).toInt());
     camera.url = query.value(4).toString().toStdString();
     camera.enabled = query.value(5).toInt() != 0;
+    camera.record_enabled = query.value(6).toInt() != 0;
     return camera;
 }
 
@@ -41,7 +42,8 @@ std::expected<void, QString> DBManager::createCamerasTable()
             name        TEXT    NOT NULL,
             stream_type INTEGER NOT NULL DEFAULT 0,
             url         TEXT    NOT NULL,
-            enabled     INTEGER NOT NULL DEFAULT 1
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            record_enabled INTEGER NOT NULL DEFAULT 0
         )
     )";
 
@@ -65,7 +67,7 @@ std::expected<void, QString> DBManager::validateCamerasTable()
         return std::unexpected(QString("cameras 테이블이 존재하지 않습니다."));
     }
 
-    const QStringList requiredColumns = {"id", "camera_id", "name", "stream_type", "url", "enabled"};
+    const QStringList requiredColumns = {"id", "camera_id", "name", "stream_type", "url", "enabled", "record_enabled"};
 
     if (!query.exec("PRAGMA table_info(cameras)")) {
         return std::unexpected(query.lastError().text());
@@ -99,8 +101,8 @@ std::expected<void, QString> DBManager::addCamera(const camera_info& camera)
 {
     QSqlQuery query(db);
     if (!query.prepare(R"(
-        INSERT INTO cameras (camera_id, name, stream_type, url, enabled)
-        VALUES (:camera_id, :name, :stream_type, :url, :enabled)
+        INSERT INTO cameras (camera_id, name, stream_type, url, enabled, record_enabled)
+        VALUES (:camera_id, :name, :stream_type, :url, :enabled, :record_enabled)
     )")) {
         return std::unexpected(query.lastError().text());
     }
@@ -115,6 +117,7 @@ std::expected<void, QString> DBManager::addCamera(const camera_info& camera)
     query.bindValue(":stream_type", static_cast<int>(camera.stream_type));
     query.bindValue(":url", QString::fromStdString(camera.url));
     query.bindValue(":enabled", camera.enabled ? 1 : 0);
+    query.bindValue(":record_enabled", camera.record_enabled ? 1 : 0);
 
     if (!query.exec()) {
         return std::unexpected(query.lastError().text());
@@ -139,7 +142,8 @@ std::expected<void, QString> DBManager::updateCameraByCameraId(const camera_info
         SET name = :name,
             stream_type = :stream_type,
             url = :url,
-            enabled = :enabled
+            enabled = :enabled,
+            record_enabled = :record_enabled
         WHERE camera_id = :camera_id
     )")) {
         return std::unexpected(query.lastError().text());
@@ -149,6 +153,7 @@ std::expected<void, QString> DBManager::updateCameraByCameraId(const camera_info
     query.bindValue(":stream_type", static_cast<int>(camera.stream_type));
     query.bindValue(":url", QString::fromStdString(camera.url));
     query.bindValue(":enabled", camera.enabled ? 1 : 0);
+    query.bindValue(":record_enabled", camera.record_enabled ? 1 : 0);
     query.bindValue(":camera_id", camera.camera_id);
 
     if (!query.exec()) {
@@ -170,7 +175,7 @@ std::expected<camera_info, QString> DBManager::getCameraByCameraId(int cameraId)
 
     QSqlQuery query(db);
     if (!query.prepare(R"(
-        SELECT id, camera_id, name, stream_type, url, enabled
+        SELECT id, camera_id, name, stream_type, url, enabled, record_enabled
         FROM cameras
         WHERE camera_id = :camera_id
     )")) {
@@ -193,7 +198,7 @@ std::expected<std::vector<camera_info>, QString> DBManager::listCameras()
 {
     QSqlQuery query(db);
     if (!query.prepare(R"(
-        SELECT id, camera_id, name, stream_type, url, enabled
+        SELECT id, camera_id, name, stream_type, url, enabled, record_enabled
         FROM cameras
         ORDER BY id ASC
     )")) {

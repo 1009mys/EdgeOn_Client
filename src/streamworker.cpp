@@ -76,8 +76,8 @@ bool openWithFallback(cv::VideoCapture& cap, const std::string& url,
 
 } // namespace
 
-StreamWorker::StreamWorker(int cellId, const QString& url, QObject* parent)
-    : QThread(parent), m_cellId(cellId), m_url(url) {}
+StreamWorker::StreamWorker(int cameraId, const QString& url, QObject* parent)
+    : QThread(parent), m_cameraId(cameraId), m_url(url) {}
 
 void StreamWorker::stop() {
     m_running = false;
@@ -127,7 +127,7 @@ void StreamWorker::run() {
 
         // UI 이벤트 큐에는 셀당 프레임 알림 1개만 유지하고, 나머지는 최신 프레임으로 덮어쓴다.
         if (!m_notifyPending.exchange(true, std::memory_order_acq_rel))
-            emit frameReady(m_cellId);
+            emit frameReady(m_cameraId);
     };
 
     const auto publishGpuFrame = [this](const cv::cuda::GpuMat& bgraFrame) {
@@ -142,28 +142,28 @@ void StreamWorker::run() {
         }
 
         if (!m_notifyPending.exchange(true, std::memory_order_acq_rel))
-            emit frameReady(m_cellId);
+            emit frameReady(m_cameraId);
     };
 
     while (!isInterruptionRequested()) {
-        emit statusChanged(m_cellId, "연결 중...");
+        emit statusChanged(m_cameraId, "연결 중...");
 
         const std::string url = m_url.toStdString();
         bool usingNvdec = false;
 
-        emit statusChanged(m_cellId, "NVDEC 연결 시도...");
+        emit statusChanged(m_cameraId, "NVDEC 연결 시도...");
         try {
             auto gpuReader = openWithNvdec(url, OPEN_TIMEOUT_MS);
             if (!gpuReader.empty()) {
                 usingNvdec = true;
-                emit statusChanged(m_cellId, m_url + " [NVDEC]");
+                emit statusChanged(m_cameraId, m_url + " [NVDEC]");
 
                 cv::cuda::GpuMat gpuFrame;
                 cv::cuda::GpuMat gpuBgra;
                 cv::cuda::Stream cudaStream;
                 while (!isInterruptionRequested()) {
                     if (!gpuReader->nextFrame(gpuFrame) || gpuFrame.empty()) {
-                        emit statusChanged(m_cellId, "스트림 끊김 – 재연결...");
+                        emit statusChanged(m_cameraId, "스트림 끊김 – 재연결...");
                         break;
                     }
 
@@ -174,7 +174,7 @@ void StreamWorker::run() {
                         gpuOutput = &gpuBgra;
                         usedCudaCvtColor = true;
                     } else if (gpuFrame.type() != CV_8UC4) {
-                        emit statusChanged(m_cellId, "지원하지 않는 GPU 포맷 – 재연결...");
+                        emit statusChanged(m_cameraId, "지원하지 않는 GPU 포맷 – 재연결...");
                         break;
                     }
 
@@ -190,16 +190,16 @@ void StreamWorker::run() {
 
         if (!usingNvdec && !isInterruptionRequested()) {
             cv::VideoCapture cap;
-            emit statusChanged(m_cellId, "NVDEC 실패 - 일반 디코더 재시도...");
+            emit statusChanged(m_cameraId, "NVDEC 실패 - 일반 디코더 재시도...");
             if (!openWithFallback(cap, url, OPEN_TIMEOUT_MS, READ_TIMEOUT_MS)) {
-                emit statusChanged(m_cellId, "연결 실패 – 재시도 중...");
+                emit statusChanged(m_cameraId, "연결 실패 – 재시도 중...");
             } else {
-                emit statusChanged(m_cellId, m_url);
+                emit statusChanged(m_cameraId, m_url);
 
                 cv::Mat frame;
                 while (!isInterruptionRequested()) {
                     if (!cap.read(frame) || frame.empty()) {
-                        emit statusChanged(m_cellId, "스트림 끊김 – 재연결...");
+                        emit statusChanged(m_cameraId, "스트림 끊김 – 재연결...");
                         break;
                     }
 

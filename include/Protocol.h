@@ -18,6 +18,7 @@ struct camera_info {
     StreamType          stream_type;
     std::string         url; // 스트림 주소
     bool                enabled;
+    bool                record_enabled;
 };
 
 #endif //EDGEON_CLIENT_PROTOCOL_H

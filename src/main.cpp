@@ -8,6 +8,7 @@
 
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
+    app.setQuitOnLastWindowClosed(false);
     QCoreApplication::setOrganizationName("EdgeOn");
     QCoreApplication::setOrganizationDomain("edgeon.local");
     QCoreApplication::setApplicationName("RTSP 멀티채널 뷰어");

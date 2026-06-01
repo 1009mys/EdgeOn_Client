@@ -2,10 +2,12 @@
 #include <QMainWindow>
 #include <QVector>
 #include <QMap>
+#include <QSet>
 #include <QGridLayout>
 #include <QString>
 #include "videocell.h"
 #include "streamworker.h"
+#include "recorderworker.h"
 
 class QLabel;
 class QMenu;
@@ -15,7 +17,11 @@ class QListWidgetItem;
 class QLineEdit;
 class QComboBox;
 class QCheckBox;
+class QPushButton;
 class QSpinBox;
+class QSystemTrayIcon;
+class QAction;
+class QCloseEvent;
 struct camera_info;
 
 class MainWindow : public QMainWindow {
@@ -30,18 +36,35 @@ public:
 
 private slots:
     void onAddRequested   (int cellId, const QString& url);
+    void onAddRequestedByCamera(int cellId, int cameraId, const QString& url);
     void onMoveRequested  (int fromCellId, int toCellId);
     void onRemoveRequested(int cellId);
-    void onFrameReady     (int cellId);
-    void onStatusChanged  (int cellId, const QString& status);
+    void onFrameReady     (int cameraId);
+    void onStatusChanged  (int cameraId, const QString& status);
+    void onRecorderStatusChanged(int cameraId, const QString& status);
     void loadUrlsFromFile ();
     void removeAllStreams ();
     void addStreamAddress();
     void updateSelectedStreamAddress();
     void removeSelectedStreamAddress();
     void onStreamListDoubleClicked(QListWidgetItem* item);
+    void showFromTray();
+    void quitFromTray();
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
 
 private:
+    struct StreamSession {
+        int cameraId{0};
+        QString url;
+        QString lastStatus;
+        bool recordRequested{false};
+        StreamWorker* worker{nullptr};
+        RecorderWorker* recorder{nullptr};
+        QSet<int> attachedCells;
+    };
+
     void buildUi();
     void clearGridItems();
     void applyGridLayout(int rows, int cols);
@@ -50,13 +73,26 @@ private:
     void addLayoutPresetAction(QMenu* menu, const QString& text, int rows, int cols);
     void buildStreamListPanel();
     void addStream   (int cellId, const QString& url);
+    void addStreamByCamera(int cellId, int cameraId, const QString& url);
     void removeStream(int cellId);
     void updateStatusBar();
+
+    int resolveOrCreateCameraId(const QString& url);
+    void bindCellToCamera(int cellId, int cameraId, const QString& url);
+    void unbindCell(int cellId);
+    void setCameraRecordingRequested(int cameraId, bool requested);
+    void syncSessionLifetime(int cameraId);
+    void stopAndDeleteSession(StreamSession& session);
+    StreamSession* findSession(int cameraId);
+    const StreamSession* findSession(int cameraId) const;
 
     void loadCameraListFromDB();
     bool saveCameraToDB(const camera_info& camera);
     void addCameraListItem(const camera_info& camera);
+    void updateCameraItemVisualState(QListWidgetItem* item);
     void resetInlineCameraForm(bool clearSelection = false);
+    void setupSystemTray();
+    void shutdownAllSessions();
 
     QWidget*                 m_central{nullptr};
     QGridLayout*             m_grid{nullptr};
@@ -71,8 +107,21 @@ private:
     QComboBox*               m_streamTypeInput{nullptr};
     QLineEdit*               m_streamInput{nullptr};
     QCheckBox*               m_enabledInput{nullptr};
+    QPushButton*             m_recordEnabledButton{nullptr};
+    QCheckBox*               m_recordAutoDecodeInput{nullptr};
+    bool                     m_recordAutoDecodeEnabled{true};
     QVector<VideoCell*>      m_cells;
-    QMap<int, StreamWorker*> m_workers;
+    QMap<int, StreamSession> m_sessions;
+    QMap<int, int>           m_cellToCamera;
+    QMap<QString, int>       m_ephemeralCameraIds;
+    QSystemTrayIcon*         m_trayIcon{nullptr};
+    QAction*                 m_showAction{nullptr};
+    QAction*                 m_quitAction{nullptr};
+    bool                     m_allowClose{false};
+    bool                     m_isShuttingDown{false};
+    bool                     m_trayEnabled{false};
+    bool                     m_trayNoticeShown{false};
     QLabel*                  m_statusLabel{nullptr};
     int                      m_nextCameraId{1};
+    int                      m_nextEphemeralCameraId{-1};
 };

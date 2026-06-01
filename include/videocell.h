@@ -33,6 +33,7 @@ public:
 
 signals:
     void addRequested   (int cellId, QString url);
+    void addRequestedByCamera(int cellId, int cameraId, QString url);
     void moveRequested  (int fromCellId, int toCellId);
     void removeRequested(int cellId);
 

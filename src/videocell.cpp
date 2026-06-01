@@ -34,6 +34,7 @@
 
 static constexpr int STATUS_H = 14;
 static constexpr const char* CELL_DRAG_MIME = "application/x-rtsp-viewer-cell-id";
+static constexpr const char* CAMERA_ID_MIME = "application/x-edgeon-camera-id";
 
 namespace {
 
@@ -377,7 +378,19 @@ void VideoCell::dropEvent(QDropEvent* ev) {
     }
 
     if (!url.isEmpty()) {
-        emit addRequested(m_cellId, url);
+        bool hasCameraId = false;
+        int cameraId = 0;
+        if (md->hasFormat(CAMERA_ID_MIME)) {
+            bool ok = false;
+            cameraId = QString::fromUtf8(md->data(CAMERA_ID_MIME)).toInt(&ok);
+            hasCameraId = ok && cameraId > 0;
+        }
+
+        if (hasCameraId) {
+            emit addRequestedByCamera(m_cellId, cameraId, url);
+        } else {
+            emit addRequested(m_cellId, url);
+        }
         ev->acceptProposedAction();
         return;
     }

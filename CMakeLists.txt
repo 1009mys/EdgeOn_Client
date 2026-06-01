@@ -44,6 +44,18 @@ if (WIN32)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif ()
 
+set(FFMPEG_BIN_DIR "C:/ffmpeg/ffmpeg-master-latest-win64-gpl-shared/bin" CACHE PATH "Directory containing ffmpeg.exe and runtime DLLs")
+set(FFMPEG_EXECUTABLE "" CACHE FILEPATH "Path to ffmpeg executable for recorder (optional, overrides FFMPEG_BIN_DIR)")
+
+if(WIN32)
+    if(NOT FFMPEG_EXECUTABLE AND FFMPEG_BIN_DIR)
+        set(_ffmpeg_from_bin "${FFMPEG_BIN_DIR}/ffmpeg.exe")
+        if(EXISTS "${_ffmpeg_from_bin}")
+            set(FFMPEG_EXECUTABLE "${_ffmpeg_from_bin}")
+        endif()
+    endif()
+endif()
+
 # ── 패키지 탐색 ─────────────────────────────────────────────────
 find_package(Qt6 COMPONENTS Widgets Sql REQUIRED)
 
@@ -58,6 +70,7 @@ set(CMAKE_AUTORCC ON)
 add_executable(EdgeOn_Client
         src/main.cpp
         include/streamworker.h src/streamworker.cpp
+        include/recorderworker.h src/recorderworker.cpp
         include/videocell.h src/videocell.cpp
         include/mainwindow.h src/mainwindow.cpp
         src/DBManager.cpp
@@ -117,6 +130,37 @@ if(WIN32)
             "$<$<CONFIG:Debug>:${OpenCV_DLL_DEBUG}>$<$<NOT:$<CONFIG:Debug>>:${OpenCV_DLL_RELEASE}>"
             "$<TARGET_FILE_DIR:EdgeOn_Client>"
     )
+
+    if(FFMPEG_EXECUTABLE AND EXISTS "${FFMPEG_EXECUTABLE}")
+        list(APPEND _opencv_runtime_copy_commands
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FFMPEG_EXECUTABLE}"
+                "$<TARGET_FILE_DIR:EdgeOn_Client>/ffmpeg${CMAKE_EXECUTABLE_SUFFIX}"
+        )
+
+        install(PROGRAMS "${FFMPEG_EXECUTABLE}"
+            DESTINATION ${CMAKE_INSTALL_BINDIR}
+            RENAME "ffmpeg${CMAKE_EXECUTABLE_SUFFIX}"
+        )
+
+        get_filename_component(_ffmpeg_bin_dir "${FFMPEG_EXECUTABLE}" DIRECTORY)
+        file(GLOB _ffmpeg_runtime_dlls "${_ffmpeg_bin_dir}/*.dll")
+        foreach(_ffmpeg_dll ${_ffmpeg_runtime_dlls})
+            list(APPEND _opencv_runtime_copy_commands
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_ffmpeg_dll}"
+                    "$<TARGET_FILE_DIR:EdgeOn_Client>"
+            )
+        endforeach()
+
+        if(_ffmpeg_runtime_dlls)
+            install(FILES ${_ffmpeg_runtime_dlls}
+                DESTINATION ${CMAKE_INSTALL_BINDIR}
+            )
+        endif()
+    else()
+        message(WARNING "ffmpeg executable not found. Set FFMPEG_EXECUTABLE or FFMPEG_BIN_DIR. Current FFMPEG_BIN_DIR='${FFMPEG_BIN_DIR}'")
+    endif()
 
     # FFMPEG backend 플러그인 DLL은 opencv_world와 별개라서 실행 폴더에 별도 배포가 필요하다.
     if(EXISTS "${OpenCV_FFMPEG_DLL}")
