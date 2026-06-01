@@ -2,6 +2,7 @@
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QFile>
 #include <QFileInfo>
 #include <QDir>
 #include <QProcess>
@@ -50,7 +51,7 @@ QString resolveFfmpegProgram()
 	return {};
 }
 
-}
+} // namespace
 
 RecorderWorker::RecorderWorker(int cameraId,
 							   const QString& url,
@@ -77,14 +78,18 @@ void RecorderWorker::run()
 	}
 
 	while (m_running.load(std::memory_order_acquire) && !isInterruptionRequested()) {
+
+		// ── ffmpeg 경로 확인 ─────────────────────────────────
 		const QString ffmpegProgram = resolveFfmpegProgram();
 		if (ffmpegProgram.isEmpty()) {
 			emit statusChanged(m_cameraId,
-							   "녹화 시작 실패: ffmpeg를 찾을 수 없습니다 (EDGEON_FFMPEG_PATH 또는 record/ffmpegPath 설정 필요)");
+							   "녹화 시작 실패: ffmpeg를 찾을 수 없습니다 "
+							   "(EDGEON_FFMPEG_PATH 또는 record/ffmpegPath 설정 필요)");
 			break;
 		}
 
-		const QString safeRoot = m_outputRoot.isEmpty() ? QStringLiteral("E:/EdgeOn") : m_outputRoot;
+		// ── 저장 폴더 확인 ────────────────────────────────────
+		const QString safeRoot      = m_outputRoot.isEmpty() ? QStringLiteral("E:/EdgeOn") : m_outputRoot;
 		const QString cameraDirPath = QDir::cleanPath(safeRoot + QString("/camera_%1").arg(m_cameraId));
 		QDir cameraDir(cameraDirPath);
 		if (!cameraDir.exists() && !cameraDir.mkpath(".")) {
@@ -92,23 +97,28 @@ void RecorderWorker::run()
 			break;
 		}
 
-		const QString startStamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-		const QString filePattern = cameraDir.filePath(
-			QString("camera_%1_%2_%05d.mkv").arg(m_cameraId).arg(startStamp));
+		// ── 세그먼트 파일명 결정 ──────────────────────────────
+		// 녹화 시작 시각 기록, 종료 시각은 실제 ffmpeg 종료 후 결정
+		const QDateTime startDt    = QDateTime::currentDateTime();
+		const QString   startStamp = startDt.toString("yyyyMMdd_HHmmss");
 
+		// 녹화 중에는 임시 이름 사용
+		const QString tempFileName = QString("camera_%1_%2_RECORDING.mkv")
+										 .arg(m_cameraId).arg(startStamp);
+		const QString tempFilePath = cameraDir.filePath(tempFileName);
+
+		// ── ffmpeg 인수 구성 ──────────────────────────────────
+		// 세그먼트 1개 = -t segmentSeconds 로 정확히 잘라냄
 		QStringList args;
 		args << "-hide_banner"
 			 << "-loglevel" << "warning"
 			 << "-rtsp_transport" << "tcp"
 			 << "-i" << m_url
+			 << "-t" << QString::number(m_segmentSeconds)
 			 << "-map" << "0"
 			 << "-c" << "copy"
-			 << "-f" << "segment"
-			 << "-segment_time" << QString::number(m_segmentSeconds)
-			 << "-segment_format" << "matroska"
-			 << "-reset_timestamps" << "1"
 			 << "-y"
-			 << filePattern;
+			 << tempFilePath;
 
 		QProcess process;
 		process.setProcessChannelMode(QProcess::MergedChannels);
@@ -122,47 +132,71 @@ void RecorderWorker::run()
 		emit statusChanged(m_cameraId,
 						   QString("녹화 중 (원본 copy, %1초 분할)").arg(m_segmentSeconds));
 
+		// ── ffmpeg 완료 대기 (중단 요청 감시) ────────────────
 		while (m_running.load(std::memory_order_acquire) && !isInterruptionRequested()) {
-			if (process.waitForFinished(500)) {
+			if (process.waitForFinished(500))
 				break;
-			}
 		}
 
+		// ── 프로세스 강제 종료 (중단 요청 수신) ──────────────
 		if (process.state() != QProcess::NotRunning) {
 			process.terminate();
 			if (!process.waitForFinished(3000)) {
 				process.kill();
 				process.waitForFinished();
 			}
+			// 실제 종료 시각으로 파일 rename
+			renameWithEndTime(tempFilePath, cameraDirPath, startStamp);
 			emit statusChanged(m_cameraId, "녹화 중지");
 			break;
 		}
 
-		const int exitCode = process.exitCode();
+		// ── 정상 종료: 파일 rename ────────────────────────────
+		renameWithEndTime(tempFilePath, cameraDirPath, startStamp);
+
 		if (!m_running.load(std::memory_order_acquire) || isInterruptionRequested()) {
 			emit statusChanged(m_cameraId, "녹화 중지");
 			break;
 		}
 
-		const QString processLog = QString::fromLocal8Bit(process.readAll()).trimmed();
+		const int exitCode = process.exitCode();
 		if (exitCode == 0) {
-			emit statusChanged(m_cameraId, "녹화 완료");
-			break;
+			// 세그먼트 정상 완료 → 다음 세그먼트 바로 시작
+			continue;
 		}
 
-		const QString brief = processLog.isEmpty()
-								  ? QStringLiteral("ffmpeg 비정상 종료")
-								  : processLog.left(180);
-		emit statusChanged(m_cameraId, QString("녹화 재연결 대기: %1").arg(brief));
+		// ── 오류 종료: 재연결 대기 ────────────────────────────
+		const QString brief = QString::fromLocal8Bit(process.readAll()).trimmed().left(180);
+		emit statusChanged(m_cameraId,
+						   QString("녹화 재연결 대기: %1").arg(brief.isEmpty()
+								? "ffmpeg 비정상 종료" : brief));
 
 		for (int i = 0; i < (kReconnectDelayMs / 100); ++i) {
-			if (!m_running.load(std::memory_order_acquire) || isInterruptionRequested()) {
+			if (!m_running.load(std::memory_order_acquire) || isInterruptionRequested())
 				break;
-			}
 			msleep(100);
 		}
 	}
 }
+
+void RecorderWorker::renameWithEndTime(const QString& tempPath,
+									   const QString& dirPath,
+									   const QString& startStamp)
+{
+	const QString endStamp   = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+	const QString finalName  = QString("camera_%1_%2_%3.mkv")
+								   .arg(m_cameraId).arg(startStamp).arg(endStamp);
+	const QString finalPath  = QDir(dirPath).filePath(finalName);
+
+	if (QFileInfo::exists(tempPath)) {
+		if (!QFile::rename(tempPath, finalPath)) {
+			// rename 실패 시 원래 이름 유지 (로그는 상태 신호로 전달)
+			emit statusChanged(m_cameraId,
+							   QString("파일 이름 변경 실패: %1").arg(tempPath));
+		}
+	}
+}
+
 
 
 

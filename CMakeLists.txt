@@ -57,7 +57,7 @@ if(WIN32)
 endif()
 
 # ── 패키지 탐색 ─────────────────────────────────────────────────
-find_package(Qt6 COMPONENTS Widgets Sql REQUIRED)
+find_package(Qt6 COMPONENTS Widgets Sql Multimedia MultimediaWidgets REQUIRED)
 
 message(STATUS "OpenCV include : ${OpenCV_INCLUDE_DIRS}")
 message(STATUS "OpenCV lib dir : ${OpenCV_LIB_DIR}")
@@ -77,6 +77,8 @@ add_executable(EdgeOn_Client
         include/DBManager.h
         src/DBManager_cameras.cpp
         include/Protocol.h
+        include/vodtimeline.h src/vodtimeline.cpp
+        include/vodpanel.h src/vodpanel.cpp
 )
 
 set_target_properties(EdgeOn_Client PROPERTIES
@@ -96,6 +98,8 @@ target_link_directories(EdgeOn_Client PRIVATE ${OpenCV_LIB_DIR})
 target_link_libraries(EdgeOn_Client PRIVATE
     Qt6::Widgets
     Qt6::Sql
+    Qt6::Multimedia
+    Qt6::MultimediaWidgets
     opencv_world4130$<$<CONFIG:Debug>:d>
 )
 

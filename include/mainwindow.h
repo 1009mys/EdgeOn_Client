@@ -22,6 +22,8 @@ class QSpinBox;
 class QSystemTrayIcon;
 class QAction;
 class QCloseEvent;
+class QStackedWidget;
+class VodPanel;
 struct camera_info;
 
 class MainWindow : public QMainWindow {
@@ -124,4 +126,6 @@ private:
     QLabel*                  m_statusLabel{nullptr};
     int                      m_nextCameraId{1};
     int                      m_nextEphemeralCameraId{-1};
+    QStackedWidget*          m_stackedMain{nullptr};
+    VodPanel*                m_vodPanel{nullptr};
 };

@@ -1,9 +1,11 @@
 #include "mainwindow.h"
 
 #include "DBManager.h"
+#include "vodpanel.h"
 
 #include <QWidget>
 #include <QGridLayout>
+#include <QStackedWidget>
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #endif
@@ -307,10 +309,75 @@ void MainWindow::buildUi() {
     }
     setCentralWidget(m_central);
 
+    // ── VOD 패널 + 스택 위젯 ────────────────────────────────
+    m_vodPanel    = new VodPanel(QString::fromUtf8(kRecordOutputRoot), this);
+    m_stackedMain = new QStackedWidget(this);
+    m_stackedMain->addWidget(m_central);   // index 0 : 실시간 관제
+    m_stackedMain->addWidget(m_vodPanel);  // index 1 : 저장영상 확인
+    setCentralWidget(m_stackedMain);
+
     // ── 툴바 ─────────────────────────────────────────────────
     auto* tb = addToolBar("도구");
     tb->setMovable(false);
     tb->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+
+    // ── 모드 전환 버튼 ────────────────────────────────────────
+    const QString modeButtonStyle = R"(
+        QPushButton {
+            font-size: 14px;
+            font-weight: bold;
+            padding: 6px 18px;
+            border: 2px solid #555;
+            border-radius: 6px;
+            background-color: #3c3c3c;
+            color: #cccccc;
+        }
+        QPushButton:checked {
+            background-color: #0078d4;
+            color: white;
+            border-color: #005fa3;
+        }
+        QPushButton:hover:!checked {
+            background-color: #505050;
+        }
+    )";
+
+    auto* btnLive = new QPushButton("🎥  실시간 관제", tb);
+    auto* btnAI   = new QPushButton("🤖  지능형 관제", tb);
+    auto* btnVod  = new QPushButton("🗂  저장영상 확인", tb);
+
+    for (auto* btn : {btnLive, btnAI, btnVod}) {
+        btn->setCheckable(true);
+        btn->setStyleSheet(modeButtonStyle);
+        btn->setMinimumHeight(36);
+    }
+    btnLive->setChecked(true);   // 기본 모드: 실시간 관제
+
+    auto switchMode = [btnLive, btnAI, btnVod](QPushButton* active) {
+        for (auto* btn : {btnLive, btnAI, btnVod}) {
+            btn->setChecked(btn == active);
+        }
+    };
+    connect(btnLive, &QPushButton::clicked, this, [this, switchMode, btnLive]() {
+        switchMode(btnLive);
+        if (m_stackedMain) m_stackedMain->setCurrentIndex(0);
+    });
+    connect(btnAI,   &QPushButton::clicked, this, [switchMode, btnAI]() {
+        switchMode(btnAI);
+    });
+    connect(btnVod,  &QPushButton::clicked, this, [this, switchMode, btnVod]() {
+        switchMode(btnVod);
+        if (m_stackedMain) {
+            m_stackedMain->setCurrentIndex(1);
+            if (m_vodPanel) m_vodPanel->setFocus();
+        }
+    });
+
+    tb->addWidget(btnLive);
+    tb->addWidget(btnAI);
+    tb->addWidget(btnVod);
+
+    tb->addSeparator();
 
     auto* actLoad = tb->addAction("📂  URL 목록 불러오기");
     actLoad->setToolTip("한 줄에 URL 하나씩 적힌 .txt 파일을 선택합니다.\n'#'으로 시작하는 줄은 주석으로 무시됩니다.");
@@ -348,6 +415,18 @@ void MainWindow::buildUi() {
     layoutButton->setPopupMode(QToolButton::InstantPopup);
     layoutButton->setMenu(layoutMenu);
     tb->addWidget(layoutButton);
+
+    // ── 스트림 목록 → VOD 연결 (VOD 모드일 때 클릭 시 해당 카메라 로드) ──
+    connect(m_streamList, &QListWidget::currentItemChanged, this,
+            [this](QListWidgetItem* current, QListWidgetItem*) {
+                if (!m_stackedMain || m_stackedMain->currentIndex() != 1) return;
+                if (!current || !m_vodPanel) return;
+                const int cameraId = current->data(kCameraIdRole).toInt();
+                if (cameraId > 0) {
+                    const int segSecs = effectiveRecordSegmentSeconds();
+                    m_vodPanel->loadCamera(cameraId, segSecs);
+                }
+            });
 
     // ── 상태바 ────────────────────────────────────────────────
     m_statusLabel = new QLabel(this);

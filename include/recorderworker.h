@@ -25,6 +25,9 @@ protected:
 	void run() override;
 
 private:
+	void renameWithEndTime(const QString& tempPath,
+						   const QString& dirPath,
+						   const QString& startStamp);
 	int m_cameraId;
 	QString m_url;
 	QString m_outputRoot;
