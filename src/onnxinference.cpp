@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <limits>
-#include <memory>
 #include <numeric>
 #include <string>
 #include <stdexcept>
@@ -86,8 +85,15 @@ Ort::Value makeZeroTensor(const Ort::MemoryInfo& memoryInfo,
 } // namespace
 
 OnnxInference::OnnxInference()
-    : m_env(std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "OnnxInference")) {
+{
+    m_env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "OnnxInference");
     m_lastLoadMessage = "No model loaded.";
+}
+
+OnnxInference::~OnnxInference() {
+    close();
+    delete m_env;
+    m_env = nullptr;
 }
 
 void OnnxInference::load(std::string path) {
@@ -96,9 +102,9 @@ void OnnxInference::load(std::string path) {
     const auto createSession = [this, &path](Ort::SessionOptions& options) {
 #ifdef _WIN32
         const std::wstring widePath(path.begin(), path.end());
-        return std::make_unique<Ort::Session>(*m_env, widePath.c_str(), options);
+        return new Ort::Session(*m_env, widePath.c_str(), options);
 #else
-        return std::make_unique<Ort::Session>(*m_env, path.c_str(), options);
+        return new Ort::Session(*m_env, path.c_str(), options);
 #endif
     };
 
@@ -112,11 +118,13 @@ void OnnxInference::load(std::string path) {
             throw std::runtime_error(errorMessage);
         }
 
+        delete m_session;
         m_session = createSession(cudaOptions);
         m_activeProvider = ExecutionProvider::CUDA;
         m_lastLoadMessage = "Loaded with CUDA execution provider.";
     } catch (const std::exception& cudaError) {
         Ort::SessionOptions cpuOptions = makeBaseSessionOptions();
+        delete m_session;
         m_session = createSession(cpuOptions);
         m_activeProvider = ExecutionProvider::CPU;
         m_lastLoadMessage = std::string("CUDA unavailable, CPU fallback used: ") + cudaError.what();
@@ -253,7 +261,8 @@ bool OnnxInference::test() {
 }
 
 void OnnxInference::close() {
-    m_session.reset();
+    delete m_session;
+    m_session = nullptr;
     m_activeProvider = ExecutionProvider::CPU;
 
     m_inputNames.clear();

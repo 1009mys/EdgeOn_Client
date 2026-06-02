@@ -23,6 +23,10 @@ public:
 
     void initialize();
 
+    std::expected<void, QString> saveDetectionResults(const detection_frame_info& frameInfo,
+                                                      const std::vector<detection_result>& detections);
+    std::expected<void, QString> purgeDetectionResultsBefore(qint64 cutoffUtcMs);
+
 
 private:
     explicit DBManager(const QString& path);
@@ -34,6 +38,9 @@ private:
     std::expected<void, QString> createTables();
     // DB 파일이 이미 존재할 때 내부 스키마/테이블을 검증
     std::expected<void, QString> validateDB();
+    std::expected<void, QString> createDetectionTables();
+    std::expected<void, QString> validateDetectionTables();
+    std::expected<void, QString> purgeExpiredDetectionResults();
 
 
 // ========================================================================================================

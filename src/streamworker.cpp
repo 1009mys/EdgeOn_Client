@@ -4,6 +4,7 @@
 #include <opencv2/core/cuda.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <QMutexLocker>
+#include <QDateTime>
 #include <QtGlobal>
 #include <iostream>
 #include <vector>
@@ -88,20 +89,32 @@ void StreamWorker::setAnalysisBusy(bool busy) {
     m_analysisBusy.store(busy, std::memory_order_release);
 }
 
-bool StreamWorker::takeLatestFrame(QImage& outFrame) {
+bool StreamWorker::takeLatestFrame(QImage& outFrame, qint64& outFrameUtcMs, qint64& outFrameSeq, cv::Size& outFrameSize) {
     QMutexLocker lock(&m_frameMutex);
     if (m_latestFrame.isNull()) return false;
     outFrame = m_latestFrame;
+    outFrameUtcMs = m_latestFrameUtcMs;
+    outFrameSeq = m_latestFrameSeq;
+    outFrameSize = m_latestFrameSize;
     m_latestFrame = QImage();
+    m_latestFrameUtcMs = 0;
+    m_latestFrameSeq = 0;
+    m_latestFrameSize = {};
     m_notifyPending.store(false, std::memory_order_release);
     return true;
 }
 
-bool StreamWorker::takeLatestGpuFrame(cv::cuda::GpuMat& outFrame) {
+bool StreamWorker::takeLatestGpuFrame(cv::cuda::GpuMat& outFrame, qint64& outFrameUtcMs, qint64& outFrameSeq, cv::Size& outFrameSize) {
     QMutexLocker lock(&m_frameMutex);
     if (m_latestGpuFrame.empty()) return false;
     outFrame = m_latestGpuFrame;
+    outFrameUtcMs = m_latestFrameUtcMs;
+    outFrameSeq = m_latestFrameSeq;
+    outFrameSize = m_latestFrameSize;
     m_latestGpuFrame.release();
+    m_latestFrameUtcMs = 0;
+    m_latestFrameSeq = 0;
+    m_latestFrameSize = {};
     m_notifyPending.store(false, std::memory_order_release);
     return true;
 }
@@ -114,6 +127,8 @@ void StreamWorker::run() {
     const auto publishFrame = [this](const cv::Mat& frame) {
         cv::Mat bgraFrame;
         const cv::Mat* imageSource = &frame;
+        const qint64 frameUtcMs = QDateTime::currentMSecsSinceEpoch();
+        const qint64 frameSeq = m_frameSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (frame.type() != CV_8UC4) {
             cv::cvtColor(frame, bgraFrame, cv::COLOR_BGR2BGRA);
@@ -127,6 +142,9 @@ void StreamWorker::run() {
             QMutexLocker lock(&m_frameMutex);
             m_latestGpuFrame.release();
             m_latestFrame = img.copy();
+            m_latestFrameUtcMs = frameUtcMs;
+            m_latestFrameSeq = frameSeq;
+            m_latestFrameSize = frame.size();
         }
 
         // UI 이벤트 큐에는 셀당 프레임 알림 1개만 유지하고, 나머지는 최신 프레임으로 덮어쓴다.
@@ -138,11 +156,17 @@ void StreamWorker::run() {
         if (bgraFrame.empty() || bgraFrame.type() != CV_8UC4)
             return;
 
+        const qint64 frameUtcMs = QDateTime::currentMSecsSinceEpoch();
+        const qint64 frameSeq = m_frameSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+
         {
             QMutexLocker lock(&m_frameMutex);
             m_latestFrame = QImage();
             // 최신 프레임만 유지하므로 deep copy 대신 헤더 공유로 복제 비용을 줄인다.
             m_latestGpuFrame = bgraFrame;
+            m_latestFrameUtcMs = frameUtcMs;
+            m_latestFrameSeq = frameSeq;
+            m_latestFrameSize = cv::Size{bgraFrame.cols, bgraFrame.rows};
         }
 
         if (!m_notifyPending.exchange(true, std::memory_order_acq_rel))

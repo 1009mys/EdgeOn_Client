@@ -32,6 +32,44 @@ int64_t safeShapeValue(const std::vector<int64_t>& shape, const size_t index) {
 
 } // namespace
 
+Yolov8CudaPreprocessResult::~Yolov8CudaPreprocessResult() {
+    if (gpuBuffer != nullptr) {
+        cudaFree(gpuBuffer);
+        gpuBuffer = nullptr;
+    }
+}
+
+Yolov8CudaPreprocessResult::Yolov8CudaPreprocessResult(Yolov8CudaPreprocessResult&& other) noexcept
+    : tensors(std::move(other.tensors)),
+      gpuBuffer(other.gpuBuffer),
+      originalSize(other.originalSize),
+      inputSize(other.inputSize),
+      scale(other.scale),
+      padX(other.padX),
+      padY(other.padY) {
+    other.gpuBuffer = nullptr;
+}
+
+Yolov8CudaPreprocessResult& Yolov8CudaPreprocessResult::operator=(Yolov8CudaPreprocessResult&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+
+    if (gpuBuffer != nullptr) {
+        cudaFree(gpuBuffer);
+    }
+
+    tensors = std::move(other.tensors);
+    gpuBuffer = other.gpuBuffer;
+    originalSize = other.originalSize;
+    inputSize = other.inputSize;
+    scale = other.scale;
+    padX = other.padX;
+    padY = other.padY;
+    other.gpuBuffer = nullptr;
+    return *this;
+}
+
 Yolov8Inference::Yolov8Inference() = default;
 
 void Yolov8Inference::load(std::string path) {
@@ -155,8 +193,8 @@ Yolov8PreprocessResult Yolov8Inference::preprocess(const cv::Mat& image) const {
     const int height = rgb.rows;
     const size_t planeSize = static_cast<size_t>(width) * static_cast<size_t>(height);
 
-    result.tensorKeeper = std::make_shared<std::vector<float>>(planeSize * 3);
-    std::vector<float>& buffer = *result.tensorKeeper;
+    result.tensorBuffer.resize(planeSize * 3);
+    std::vector<float>& buffer = result.tensorBuffer;
 
     for (int y = 0; y < height; ++y) {
         const cv::Vec3f* row = rgb.ptr<cv::Vec3f>(y);
@@ -628,8 +666,7 @@ Yolov8CudaPreprocessResult Yolov8Inference::preprocess_cuda(const cv::cuda::GpuM
         throw std::runtime_error("cudaMalloc failed in preprocess_cuda.");
     }
 
-    // shared_ptr 가 rawPtr 소유권 관리 (cudaFree 로 해제)
-    result.gpuBuffer = std::shared_ptr<float>(rawPtr, [](float* p) { cudaFree(p); });
+    result.gpuBuffer = rawPtr;
 
     // 각 채널을 순서대로 GPU 버퍼에 memcpy (device→device)
     for (int c = 0; c < 3; ++c) {

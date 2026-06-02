@@ -106,6 +106,7 @@ void RecorderWorker::run()
 		const QString tempFileName = QString("camera_%1_%2_RECORDING.mkv")
 										 .arg(m_cameraId).arg(startStamp);
 		const QString tempFilePath = cameraDir.filePath(tempFileName);
+		emit segmentStarted(m_cameraId, startDt.toMSecsSinceEpoch(), m_segmentSeconds, tempFilePath);
 
 		// ── ffmpeg 인수 구성 ──────────────────────────────────
 		// 세그먼트 1개 = -t segmentSeconds 로 정확히 잘라냄
@@ -146,13 +147,21 @@ void RecorderWorker::run()
 				process.waitForFinished();
 			}
 			// 실제 종료 시각으로 파일 rename
-			renameWithEndTime(tempFilePath, cameraDirPath, startStamp);
+			const QString finalPath = renameWithEndTime(tempFilePath, cameraDirPath, startStamp);
+			emit segmentFinished(m_cameraId,
+								 startDt.toMSecsSinceEpoch(),
+								 QDateTime::currentMSecsSinceEpoch(),
+								 finalPath.isEmpty() ? tempFilePath : finalPath);
 			emit statusChanged(m_cameraId, "녹화 중지");
 			break;
 		}
 
 		// ── 정상 종료: 파일 rename ────────────────────────────
-		renameWithEndTime(tempFilePath, cameraDirPath, startStamp);
+		const QString finalPath = renameWithEndTime(tempFilePath, cameraDirPath, startStamp);
+		emit segmentFinished(m_cameraId,
+							 startDt.toMSecsSinceEpoch(),
+							 QDateTime::currentMSecsSinceEpoch(),
+							 finalPath.isEmpty() ? tempFilePath : finalPath);
 
 		if (!m_running.load(std::memory_order_acquire) || isInterruptionRequested()) {
 			emit statusChanged(m_cameraId, "녹화 중지");
@@ -179,7 +188,7 @@ void RecorderWorker::run()
 	}
 }
 
-void RecorderWorker::renameWithEndTime(const QString& tempPath,
+QString RecorderWorker::renameWithEndTime(const QString& tempPath,
 									   const QString& dirPath,
 									   const QString& startStamp)
 {
@@ -193,8 +202,11 @@ void RecorderWorker::renameWithEndTime(const QString& tempPath,
 			// rename 실패 시 원래 이름 유지 (로그는 상태 신호로 전달)
 			emit statusChanged(m_cameraId,
 							   QString("파일 이름 변경 실패: %1").arg(tempPath));
+			return {};
 		}
 	}
+
+	return finalPath;
 }
 
 

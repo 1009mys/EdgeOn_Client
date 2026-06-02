@@ -10,6 +10,7 @@
 #include <mutex>
 #include <queue>
 #include <thread>
+#include "Protocol.h"
 #include "videocell.h"
 #include "streamworker.h"
 #include "recorderworker.h"
@@ -50,6 +51,8 @@ private slots:
     void onFrameReady     (int cameraId);
     void onStatusChanged  (int cameraId, const QString& status);
     void onRecorderStatusChanged(int cameraId, const QString& status);
+    void onRecorderSegmentStarted(int cameraId, qint64 startUtcMs, int segmentSeconds, const QString& tempPath);
+    void onRecorderSegmentFinished(int cameraId, qint64 startUtcMs, qint64 endUtcMs, const QString& finalPath);
     void loadUrlsFromFile ();
     void removeAllStreams ();
     void addStreamAddress();
@@ -72,6 +75,9 @@ private:
         bool analysisBusy{false};
         std::vector<Yolov8Detection> lastDetections;
         cv::Size lastDetectionFrameSize{};
+        qint64 recordSegmentStartUtcMs{0};
+        qint64 recordSegmentEndUtcMs{0};
+        QString recordSegmentFilePath;
         StreamWorker* worker{nullptr};
         RecorderWorker* recorder{nullptr};
         QSet<int> attachedCells;
@@ -80,6 +86,7 @@ private:
     struct InferenceTask {
         int cameraId{0};
         cv::cuda::GpuMat frame;
+        detection_frame_info frameInfo;
     };
 
     void buildUi();
@@ -107,7 +114,7 @@ private:
     const StreamSession* findSession(int cameraId) const;
     void ensureInferenceWorkerStarted();
     void stopInferenceWorker();
-    void enqueueInferenceTask(int cameraId, const cv::cuda::GpuMat& frame);
+    void enqueueInferenceTask(int cameraId, const cv::cuda::GpuMat& frame, const detection_frame_info& frameInfo);
 
     void loadCameraListFromDB();
     bool saveCameraToDB(const camera_info& camera);

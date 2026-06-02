@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QThread>
+#include <QString>
 
 #include <atomic>
 
@@ -20,14 +21,16 @@ public:
 
 signals:
 	void statusChanged(int cameraId, QString status);
+	void segmentStarted(int cameraId, qint64 startUtcMs, int segmentSeconds, QString tempPath);
+	void segmentFinished(int cameraId, qint64 startUtcMs, qint64 endUtcMs, QString finalPath);
 
 protected:
 	void run() override;
 
 private:
-	void renameWithEndTime(const QString& tempPath,
-						   const QString& dirPath,
-						   const QString& startStamp);
+	QString renameWithEndTime(const QString& tempPath,
+							   const QString& dirPath,
+							   const QString& startStamp);
 	int m_cameraId;
 	QString m_url;
 	QString m_outputRoot;

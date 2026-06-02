@@ -1,6 +1,5 @@
 #pragma once
 
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -17,7 +16,7 @@ struct Yolov8Detection {
 
 struct Yolov8PreprocessResult {
     std::vector<Ort::Value> tensors;
-    std::shared_ptr<std::vector<float>> tensorKeeper;
+    std::vector<float> tensorBuffer;
     cv::Size originalSize{};
     cv::Size inputSize{};
     float scale{1.0f};
@@ -30,12 +29,19 @@ struct Yolov8PreprocessResult {
 // tensors 안의 Ort::Value가 해당 포인터를 직접 참조한다.
 struct Yolov8CudaPreprocessResult {
     std::vector<Ort::Value> tensors;
-    std::shared_ptr<float> gpuBuffer; // CUDA 메모리 소유권 보관
+    float* gpuBuffer{nullptr}; // CUDA 메모리 소유권 보관
     cv::Size originalSize{};
     cv::Size inputSize{};
     float scale{1.0f};
     int padX{0};
     int padY{0};
+
+    Yolov8CudaPreprocessResult() = default;
+    ~Yolov8CudaPreprocessResult();
+    Yolov8CudaPreprocessResult(const Yolov8CudaPreprocessResult&) = delete;
+    Yolov8CudaPreprocessResult& operator=(const Yolov8CudaPreprocessResult&) = delete;
+    Yolov8CudaPreprocessResult(Yolov8CudaPreprocessResult&& other) noexcept;
+    Yolov8CudaPreprocessResult& operator=(Yolov8CudaPreprocessResult&& other) noexcept;
 };
 
 class Yolov8Inference {

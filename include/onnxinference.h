@@ -1,6 +1,5 @@
 #pragma once
 
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -14,6 +13,7 @@ public:
     };
 
     OnnxInference();
+    ~OnnxInference();
 
     void load(std::string path);
     [[nodiscard]] bool isLoaded() const;
@@ -34,8 +34,8 @@ public:
 private:
     void refreshIoMetadata();
 
-    std::unique_ptr<Ort::Env> m_env;
-    std::unique_ptr<Ort::Session> m_session;
+    Ort::Env* m_env{nullptr};
+    Ort::Session* m_session{nullptr};
     Ort::AllocatorWithDefaultOptions m_allocator;
 
     std::vector<std::string> m_inputNames;
