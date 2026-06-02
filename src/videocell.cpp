@@ -18,6 +18,8 @@
 #include <QDateTime>
 #include <QtGlobal>
 #include <atomic>
+#include <algorithm>
+#include <array>
 #include <opencv2/cudaimgproc.hpp>
 
 #ifdef Q_OS_WIN
@@ -61,6 +63,22 @@ QRectF aspectFitRect(const QSizeF& src, const QSizeF& dst) {
         scaled.width(),
         scaled.height()
     };
+}
+
+QColor detectionColorForClassId(const int classId) {
+    static const std::array<QColor, 100> kPalette = [] {
+        std::array<QColor, 100> palette{};
+        for (size_t index = 0; index < palette.size(); ++index) {
+            const int hue = static_cast<int>((index * 137) % 360);
+            const int saturation = 180 + static_cast<int>((index % 4) * 18);
+            const int value = 210 + static_cast<int>((index % 3) * 15);
+            palette[index] = QColor::fromHsv(hue, std::min(255, saturation), std::min(255, value));
+        }
+        return palette;
+    }();
+
+    const int safeClassId = classId < 0 ? 0 : classId;
+    return kPalette[static_cast<size_t>(safeClassId) % kPalette.size()];
 }
 
 QRect videoRectFor(const QSize& size) {
@@ -270,6 +288,15 @@ void VideoCell::updateGpuFrame(const cv::cuda::GpuMat& frame) {
 #else
     Q_UNUSED(frame);
 #endif
+}
+
+void VideoCell::updateDetections(const std::vector<Yolov8Detection>& detections, const cv::Size& frameSize) {
+    {
+        QMutexLocker lock(&m_detectionMutex);
+        m_detections = detections;
+        m_detectionFrameSize = frameSize;
+    }
+    update();
 }
 
 void VideoCell::setStatus(const QString& status) {
@@ -851,6 +878,46 @@ void VideoCell::renderDirectX() {
                         static_cast<FLOAT>(destRect.bottom())),
             1.0f,
             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+
+        std::vector<Yolov8Detection> detections;
+        cv::Size detectionFrameSize;
+        {
+            QMutexLocker lock(&m_detectionMutex);
+            detections = m_detections;
+            detectionFrameSize = m_detectionFrameSize;
+        }
+
+        if (!detections.empty() && detectionFrameSize.width > 0 && detectionFrameSize.height > 0) {
+            ID2D1SolidColorBrush* detectionBrush = nullptr;
+            if (SUCCEEDED(rt->CreateSolidColorBrush(
+                    D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f),
+                    &detectionBrush))) {
+                const float scaleX = static_cast<float>(destRect.width()) /
+                                     static_cast<float>(detectionFrameSize.width);
+                const float scaleY = static_cast<float>(destRect.height()) /
+                                     static_cast<float>(detectionFrameSize.height);
+
+                for (const auto& det : detections) {
+                    const QColor color = detectionColorForClassId(det.classId);
+                    detectionBrush->SetColor(toD2D(color));
+
+                    const float x = static_cast<float>(destRect.left()) + det.box.x * scaleX;
+                    const float y = static_cast<float>(destRect.top()) + det.box.y * scaleY;
+                    const float w = std::max(0.0f, det.box.width * scaleX);
+                    const float h = std::max(0.0f, det.box.height * scaleY);
+                    if (w <= 1.0f || h <= 1.0f) {
+                        continue;
+                    }
+
+                    rt->DrawRectangle(
+                        D2D1::RectF(x, y, x + w, y + h),
+                        detectionBrush,
+                        2.0f);
+                }
+
+                detectionBrush->Release();
+            }
+        }
     } else {
         rt->FillRectangle(videoRect, m_renderState->placeholderBrush.Get());
 
@@ -944,6 +1011,31 @@ void VideoCell::paintEvent(QPaintEvent*) {
         const QRectF dest = aspectFitRect(m_frame.size(), videoRect.size());
         const QRectF translated = dest.translated(videoRect.topLeft());
         p.drawImage(translated, m_frame);
+
+        std::vector<Yolov8Detection> detections;
+        cv::Size detectionFrameSize;
+        {
+            QMutexLocker lock(&m_detectionMutex);
+            detections = m_detections;
+            detectionFrameSize = m_detectionFrameSize;
+        }
+
+        if (!detections.empty() && detectionFrameSize.width > 0 && detectionFrameSize.height > 0) {
+            const qreal scaleX = translated.width() / static_cast<qreal>(detectionFrameSize.width);
+            const qreal scaleY = translated.height() / static_cast<qreal>(detectionFrameSize.height);
+            for (const auto& det : detections) {
+                p.setPen(QPen(detectionColorForClassId(det.classId), 2));
+                const QRectF box(
+                    translated.left() + static_cast<qreal>(det.box.x) * scaleX,
+                    translated.top() + static_cast<qreal>(det.box.y) * scaleY,
+                    static_cast<qreal>(det.box.width) * scaleX,
+                    static_cast<qreal>(det.box.height) * scaleY);
+                if (box.width() <= 1.0 || box.height() <= 1.0) {
+                    continue;
+                }
+                p.drawRect(box);
+            }
+        }
     } else {
         p.fillRect(videoRect, Qt::black);
 

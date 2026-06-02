@@ -7,6 +7,9 @@
 #include <QElapsedTimer>
 #include <opencv2/core/cuda.hpp>
 #include <memory>
+#include <vector>
+
+#include "yolov8inference.h"
 
 class QDragEnterEvent;
 class QDragMoveEvent;
@@ -28,6 +31,7 @@ public:
     void deactivate();
     void updateFrame(const QImage& frame);
     void updateGpuFrame(const cv::cuda::GpuMat& frame);
+    void updateDetections(const std::vector<Yolov8Detection>& detections, const cv::Size& frameSize);
     void setStatus  (const QString& status);
     QPaintEngine* paintEngine() const override;
 
@@ -69,6 +73,9 @@ private:
     int m_fpsFrameCount{0};
     cv::cuda::GpuMat m_gpuFrame;
     QMutex m_gpuFrameMutex;
+    std::vector<Yolov8Detection> m_detections;
+    cv::Size m_detectionFrameSize;
+    QMutex m_detectionMutex;
     bool    m_bitmapDirty{false};
     QLabel* m_statusLabel;
     bool    m_dragHover{false};

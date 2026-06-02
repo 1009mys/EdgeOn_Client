@@ -84,6 +84,10 @@ void StreamWorker::stop() {
     requestInterruption();
 }
 
+void StreamWorker::setAnalysisBusy(bool busy) {
+    m_analysisBusy.store(busy, std::memory_order_release);
+}
+
 bool StreamWorker::takeLatestFrame(QImage& outFrame) {
     QMutexLocker lock(&m_frameMutex);
     if (m_latestFrame.isNull()) return false;
@@ -167,6 +171,11 @@ void StreamWorker::run() {
                         break;
                     }
 
+                    // 추론 중에는 새 프레임을 즉시 드롭해 디코딩 파이프라인 부하를 낮춘다.
+                    if (m_analysisBusy.load(std::memory_order_acquire)) {
+                        continue;
+                    }
+
                     cv::cuda::GpuMat* gpuOutput = &gpuFrame;
                     bool usedCudaCvtColor = false;
                     if (gpuFrame.type() == CV_8UC3) {
@@ -201,6 +210,10 @@ void StreamWorker::run() {
                     if (!cap.read(frame) || frame.empty()) {
                         emit statusChanged(m_cameraId, "스트림 끊김 – 재연결...");
                         break;
+                    }
+
+                    if (m_analysisBusy.load(std::memory_order_acquire)) {
+                        continue;
                     }
 
                     publishFrame(frame);

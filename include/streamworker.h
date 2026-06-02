@@ -10,6 +10,7 @@ class StreamWorker : public QThread {
 public:
     explicit StreamWorker(int cameraId, const QString& url, QObject* parent = nullptr);
     void stop();
+    void setAnalysisBusy(bool busy);
     bool takeLatestFrame(QImage& outFrame);
     bool takeLatestGpuFrame(cv::cuda::GpuMat& outFrame);
 
@@ -28,6 +29,7 @@ private:
     QString              m_url;
     std::atomic<bool>    m_running{true};
     std::atomic<bool>    m_notifyPending{false};
+    std::atomic<bool>    m_analysisBusy{false};
     QMutex               m_frameMutex;
     QImage               m_latestFrame;
     cv::cuda::GpuMat     m_latestGpuFrame;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(EdgeOn_Client LANGUAGES CUDA CXX)
+project(EdgeOn_Client LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
@@ -12,8 +12,18 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT
     set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "Install path prefix." FORCE)
 endif()
 
-# ── CUDA 툴킷 찾기 ───────────────────────────────────────────────
-find_package(CUDAToolkit 12.9 EXACT REQUIRED )
+# ── CUDA 툴킷 찾기 (선택사항) ────────────────────────────────────
+if(NOT DEFINED SKIP_CUDA)
+    set(SKIP_CUDA FALSE)
+endif()
+
+if(NOT SKIP_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit 12.9 EXACT REQUIRED)
+    message(STATUS "CUDA Toolkit found and enabled")
+else()
+    message(STATUS "CUDA Toolkit skipped (SKIP_CUDA=ON)")
+endif()
 
 # ── Qt 경로 분기 ────────────────────────────────────────────────
 set(QT_ROOT_OVERRIDE "" CACHE PATH "Custom Qt root path (overrides auto-detection)")
@@ -46,6 +56,10 @@ endif ()
 
 set(FFMPEG_BIN_DIR "C:/ffmpeg/ffmpeg-master-latest-win64-gpl-shared/bin" CACHE PATH "Directory containing ffmpeg.exe and runtime DLLs")
 set(FFMPEG_EXECUTABLE "" CACHE FILEPATH "Path to ffmpeg executable for recorder (optional, overrides FFMPEG_BIN_DIR)")
+set(ONNXRUNTIME_ROOT "C:/onnxruntime/onnxruntime-win-x64-gpu-1.26.0" CACHE PATH "Path to ONNX Runtime root")
+
+set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/include")
+set(ONNXRUNTIME_LIB_DIR "${ONNXRUNTIME_ROOT}/lib")
 
 if(WIN32)
     if(NOT FFMPEG_EXECUTABLE AND FFMPEG_BIN_DIR)
@@ -79,6 +93,8 @@ add_executable(EdgeOn_Client
         include/Protocol.h
         include/vodtimeline.h src/vodtimeline.cpp
         include/vodpanel.h src/vodpanel.cpp
+        include/onnxinference.h src/onnxinference.cpp
+        include/yolov8inference.h src/yolov8inference.cpp
 )
 
 set_target_properties(EdgeOn_Client PROPERTIES
@@ -87,13 +103,19 @@ set_target_properties(EdgeOn_Client PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/output/$<CONFIG>/${CMAKE_INSTALL_LIBDIR}"
 )
 
-target_link_libraries(EdgeOn_Client PRIVATE
-    CUDA::cudart
-    CUDA::nvml
-    CUDA::cuda_driver
-)
+if(NOT SKIP_CUDA AND CUDAToolkit_FOUND)
+    target_link_libraries(EdgeOn_Client PRIVATE
+        CUDA::cudart
+        CUDA::nvml
+        CUDA::cuda_driver
+    )
+endif()
 
 target_link_directories(EdgeOn_Client PRIVATE ${OpenCV_LIB_DIR})
+
+if(EXISTS "${ONNXRUNTIME_LIB_DIR}")
+    target_link_directories(EdgeOn_Client PRIVATE ${ONNXRUNTIME_LIB_DIR})
+endif()
 
 target_link_libraries(EdgeOn_Client PRIVATE
     Qt6::Widgets
@@ -101,6 +123,7 @@ target_link_libraries(EdgeOn_Client PRIVATE
     Qt6::Multimedia
     Qt6::MultimediaWidgets
     opencv_world4130$<$<CONFIG:Debug>:d>
+    onnxruntime
 )
 
 if(WIN32)
@@ -110,6 +133,7 @@ endif()
 target_include_directories(EdgeOn_Client PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${OpenCV_INCLUDE_DIRS}
+    ${ONNXRUNTIME_INCLUDE_DIR}
 )
 
 install(TARGETS EdgeOn_Client
@@ -134,6 +158,26 @@ if(WIN32)
             "$<$<CONFIG:Debug>:${OpenCV_DLL_DEBUG}>$<$<NOT:$<CONFIG:Debug>>:${OpenCV_DLL_RELEASE}>"
             "$<TARGET_FILE_DIR:EdgeOn_Client>"
     )
+
+    file(GLOB _onnxruntime_lib_dlls "${ONNXRUNTIME_LIB_DIR}/*.dll")
+    file(GLOB _onnxruntime_bin_dlls "${ONNXRUNTIME_ROOT}/bin/*.dll")
+    set(_onnxruntime_runtime_dlls ${_onnxruntime_lib_dlls} ${_onnxruntime_bin_dlls})
+
+    foreach(_onnxruntime_dll ${_onnxruntime_runtime_dlls})
+        list(APPEND _opencv_runtime_copy_commands
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_onnxruntime_dll}"
+                "$<TARGET_FILE_DIR:EdgeOn_Client>"
+        )
+    endforeach()
+
+    if(_onnxruntime_runtime_dlls)
+        install(FILES ${_onnxruntime_runtime_dlls}
+            DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+    else()
+        message(WARNING "ONNX Runtime DLLs not found under '${ONNXRUNTIME_ROOT}/lib' or '${ONNXRUNTIME_ROOT}/bin'.")
+    endif()
 
     if(FFMPEG_EXECUTABLE AND EXISTS "${FFMPEG_EXECUTABLE}")
         list(APPEND _opencv_runtime_copy_commands
@@ -190,6 +234,21 @@ if(WIN32)
         install(FILES "${OpenCV_DLL_RELEASE}"
             DESTINATION ${CMAKE_INSTALL_BINDIR}
             CONFIGURATIONS Release RelWithDebInfo MinSizeRel
+        )
+    endif()
+
+    # ── models 폴더 복사 ───────────────────────────────────────
+    set(_models_source_dir "${CMAKE_CURRENT_SOURCE_DIR}/models")
+    if(EXISTS "${_models_source_dir}")
+        add_custom_command(TARGET EdgeOn_Client POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${_models_source_dir}"
+                "$<TARGET_FILE_DIR:EdgeOn_Client>/models"
+            COMMENT "Copying models directory..."
+        )
+
+        install(DIRECTORY "${_models_source_dir}/"
+            DESTINATION "${CMAKE_INSTALL_BINDIR}/models"
         )
     endif()
 

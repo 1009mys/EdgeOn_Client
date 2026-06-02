@@ -45,7 +45,10 @@
 #include <QApplication>
 #include <QStyle>
 #include <QTimer>
+#include <QMetaObject>
 #include <opencv2/core/cuda.hpp>
+
+#include <chrono>
 
 namespace {
 
@@ -55,8 +58,11 @@ constexpr int kCameraStreamTypeRole = Qt::UserRole + 3;
 constexpr int kCameraEnabledRole = Qt::UserRole + 4;
 constexpr int kCameraUrlRole = Qt::UserRole + 5;
 constexpr int kCameraRecordEnabledRole = Qt::UserRole + 6;
+constexpr int kCameraAnalysisEnabledRole = Qt::UserRole + 7;
 constexpr const char* kCameraFormExpandedSetting = "ui/streamList/cameraFormExpanded";
 constexpr const char* kRecordAutoDecodeSetting = "stream/recordAutoDecodeEnabled";
+constexpr const char* kYoloModelPath = "models/yolov8s.onnx";
+constexpr size_t kMaxInferenceQueueDepth = 16;
 constexpr const char* kCameraIdMime = "application/x-edgeon-camera-id";
 constexpr const char* kRecordOutputRoot = "E:/EdgeOn";
 constexpr int kRecordSegmentSeconds = 30;
@@ -65,6 +71,10 @@ constexpr const char* kRecordSegmentSecondsSetting = "record/segmentSeconds";
 int effectiveRecordSegmentSeconds() {
     QSettings settings;
     return qMax(1, settings.value(kRecordSegmentSecondsSetting, kRecordSegmentSeconds).toInt());
+}
+
+QString cameraAnalysisSettingKey(const int cameraId) {
+    return QString("%1/%2").arg(kRecordAutoDecodeSetting).arg(cameraId);
 }
 
 void syncRecordButtonText(QPushButton* button, bool enabled) {
@@ -256,6 +266,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
 MainWindow::~MainWindow() {
     shutdownAllSessions();
+    stopInferenceWorker();
     if (m_trayIcon) {
         m_trayIcon->hide();
     }
@@ -312,7 +323,7 @@ void MainWindow::buildUi() {
     // ── VOD 패널 + 스택 위젯 ────────────────────────────────
     m_vodPanel    = new VodPanel(QString::fromUtf8(kRecordOutputRoot), this);
     m_stackedMain = new QStackedWidget(this);
-    m_stackedMain->addWidget(m_central);   // index 0 : 실시간 관제
+    m_stackedMain->addWidget(m_central);   // index 0 : 지능형 관제
     m_stackedMain->addWidget(m_vodPanel);  // index 1 : 저장영상 확인
     setCentralWidget(m_stackedMain);
 
@@ -342,8 +353,8 @@ void MainWindow::buildUi() {
         }
     )";
 
-    auto* btnLive = new QPushButton("🎥  실시간 관제", tb);
-    auto* btnAI   = new QPushButton("🤖  지능형 관제", tb);
+    auto* btnLive = new QPushButton("🎥  지능형 관제", tb);
+    auto* btnAI   = new QPushButton("🤖  이벤트 관제", tb);
     auto* btnVod  = new QPushButton("🗂  저장영상 확인", tb);
 
     for (auto* btn : {btnLive, btnAI, btnVod}) {
@@ -351,7 +362,7 @@ void MainWindow::buildUi() {
         btn->setStyleSheet(modeButtonStyle);
         btn->setMinimumHeight(36);
     }
-    btnLive->setChecked(true);   // 기본 모드: 실시간 관제
+    btnLive->setChecked(true);   // 기본 모드: 지능형 관제
 
     auto switchMode = [btnLive, btnAI, btnVod](QPushButton* active) {
         for (auto* btn : {btnLive, btnAI, btnVod}) {
@@ -467,7 +478,7 @@ void MainWindow::buildStreamListPanel() {
     m_recordEnabledButton->setChecked(false);
     syncRecordButtonText(m_recordEnabledButton, false);
 
-    m_recordAutoDecodeInput = new QCheckBox("녹화 시 자동 디코딩", panel);
+    m_recordAutoDecodeInput = new QCheckBox("영상분석 활성화 (선택 카메라)", panel);
     {
         QSettings settings;
         m_recordAutoDecodeEnabled = settings.value(kRecordAutoDecodeSetting, true).toBool();
@@ -517,25 +528,27 @@ void MainWindow::buildStreamListPanel() {
     });
 
     connect(m_recordAutoDecodeInput, &QCheckBox::toggled, this, [this](bool checked) {
-        m_recordAutoDecodeEnabled = checked;
-        QSettings settings;
-        settings.setValue(kRecordAutoDecodeSetting, checked);
-        settings.sync();
-
-        if (!m_streamList) {
+        if (!m_streamList || m_streamListItemSyncing) {
             return;
         }
 
-        for (int i = 0; i < m_streamList->count(); ++i) {
-            auto* item = m_streamList->item(i);
-            if (!item) continue;
-
-            const int cameraId = item->data(kCameraIdRole).toInt();
-            if (cameraId <= 0) continue;
-
-            const bool recordEnabled = item->data(kCameraRecordEnabledRole).toBool();
-            setCameraRecordingRequested(cameraId, recordEnabled);
+        auto* item = m_streamList->currentItem();
+        if (!item) {
+            return;
         }
+
+        const int cameraId = item->data(kCameraIdRole).toInt();
+        if (cameraId <= 0) {
+            return;
+        }
+
+        m_streamListItemSyncing = true;
+        item->setData(kCameraAnalysisEnabledRole, checked);
+        item->setCheckState(checked ? Qt::Checked : Qt::Unchecked);
+        m_streamListItemSyncing = false;
+
+        saveCameraAnalysisEnabled(cameraId, checked);
+        setCameraAnalysisEnabled(cameraId, checked);
     });
 
     auto* addBtn = new QPushButton("추가", panel);
@@ -587,6 +600,26 @@ void MainWindow::buildStreamListPanel() {
     m_streamList->setToolTip("목록 항목을 비디오 셀로 드래그하면 해당 셀에서 스트림이 시작됩니다.");
     connect(m_streamList, &QListWidget::itemDoubleClicked,
             this, &MainWindow::onStreamListDoubleClicked);
+    connect(m_streamList, &QListWidget::itemChanged, this, [this](QListWidgetItem* item) {
+        if (!item || m_streamListItemSyncing) {
+            return;
+        }
+
+        const int cameraId = item->data(kCameraIdRole).toInt();
+        if (cameraId <= 0) {
+            return;
+        }
+
+        const bool checked = item->checkState() == Qt::Checked;
+        item->setData(kCameraAnalysisEnabledRole, checked);
+        saveCameraAnalysisEnabled(cameraId, checked);
+        setCameraAnalysisEnabled(cameraId, checked);
+
+        if (item == m_streamList->currentItem() && m_recordAutoDecodeInput) {
+            const QSignalBlocker blocker(m_recordAutoDecodeInput);
+            m_recordAutoDecodeInput->setChecked(checked);
+        }
+    });
 
     // 선택한 항목을 인라인 입력 폼으로 가져와 수정 흐름을 단순화
     connect(m_streamList, &QListWidget::currentItemChanged,
@@ -612,11 +645,16 @@ void MainWindow::buildStreamListPanel() {
                 m_streamInput->setText(url);
                 m_enabledInput->setChecked(current->data(kCameraEnabledRole).toBool());
                 const bool recordEnabled = current->data(kCameraRecordEnabledRole).toBool();
+                const bool analysisEnabled = current->data(kCameraAnalysisEnabledRole).toBool();
                 {
                     const QSignalBlocker blocker(m_recordEnabledButton);
                     m_recordEnabledButton->setChecked(recordEnabled);
                 }
                 syncRecordButtonText(m_recordEnabledButton, recordEnabled);
+                if (m_recordAutoDecodeInput) {
+                    const QSignalBlocker blocker(m_recordAutoDecodeInput);
+                    m_recordAutoDecodeInput->setChecked(analysisEnabled);
+                }
             });
 
     vbox->addWidget(foldButton);
@@ -729,6 +767,7 @@ void MainWindow::shutdownAllSessions()
     }
     m_sessions.clear();
     m_cellToCamera.clear();
+    stopInferenceWorker();
 }
 
 void MainWindow::addLayoutPresetAction(QMenu* menu, const QString& text, int rows, int cols) {
@@ -879,7 +918,15 @@ void MainWindow::onFrameReady(int cameraId) {
         for (const int cellId : session->attachedCells) {
             if (cellId >= 0 && cellId < TOTAL) {
                 m_cells[cellId]->updateGpuFrame(gpuFrame);
+                m_cells[cellId]->updateDetections(session->lastDetections, session->lastDetectionFrameSize);
             }
+        }
+
+        const bool shouldAnalyze = session->recordRequested && session->analysisEnabled;
+        if (shouldAnalyze && !gpuFrame.empty() && !session->analysisBusy) {
+            session->analysisBusy = true;
+            session->worker->setAnalysisBusy(true);
+            enqueueInferenceTask(cameraId, gpuFrame);
         }
         return;
     }
@@ -889,6 +936,7 @@ void MainWindow::onFrameReady(int cameraId) {
         for (const int cellId : session->attachedCells) {
             if (cellId >= 0 && cellId < TOTAL) {
                 m_cells[cellId]->updateFrame(frame);
+                m_cells[cellId]->updateDetections({}, cv::Size{});
             }
         }
     }
@@ -1018,13 +1066,22 @@ void MainWindow::updateSelectedStreamAddress()
     item->setData(kCameraEnabledRole, camera.enabled);
     item->setData(kCameraRecordEnabledRole, camera.record_enabled);
     item->setData(kCameraUrlRole, QString::fromStdString(camera.url));
+    const bool analysisEnabledFromSettings = loadCameraAnalysisEnabled(camera.camera_id, m_recordAutoDecodeEnabled);
+    item->setData(kCameraAnalysisEnabledRole, analysisEnabledFromSettings);
+    item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+    item->setCheckState(analysisEnabledFromSettings ? Qt::Checked : Qt::Unchecked);
     item->setToolTip(makeCameraTooltip(camera));
     updateCameraItemVisualState(item);
 
     if (camera.camera_id != oldCameraId) {
         setCameraRecordingRequested(oldCameraId, false);
+        setCameraAnalysisEnabled(oldCameraId, false);
     }
     setCameraRecordingRequested(camera.camera_id, camera.record_enabled);
+
+    const bool analysisEnabled = item->data(kCameraAnalysisEnabledRole).toBool();
+    saveCameraAnalysisEnabled(camera.camera_id, analysisEnabled);
+    setCameraAnalysisEnabled(camera.camera_id, analysisEnabled);
 
     m_nextCameraId = qMax(m_nextCameraId, camera.camera_id + 1);
     m_streamInput->setText(QString::fromStdString(camera.url));
@@ -1045,6 +1102,9 @@ void MainWindow::removeSelectedStreamAddress() {
             return;
         }
         setCameraRecordingRequested(cameraId, false);
+        setCameraAnalysisEnabled(cameraId, false);
+        QSettings settings;
+        settings.remove(cameraAnalysisSettingKey(cameraId));
     }
 
     delete m_streamList->takeItem(row);
@@ -1277,6 +1337,7 @@ void MainWindow::bindCellToCamera(int cellId, int cameraId, const QString& url)
                 session.url = QString::fromStdString(camera.url).trimmed();
                 session.recordRequested = camera.record_enabled;
             }
+            session.analysisEnabled = loadCameraAnalysisEnabled(cameraId, m_recordAutoDecodeEnabled);
         }
         m_sessions.insert(cameraId, session);
         sessionIt = m_sessions.find(cameraId);
@@ -1291,6 +1352,7 @@ void MainWindow::bindCellToCamera(int cellId, int cameraId, const QString& url)
     session.attachedCells.insert(cellId);
 
     m_cells[cellId]->activate(session.url);
+    m_cells[cellId]->updateDetections(session.lastDetections, session.lastDetectionFrameSize);
     if (!session.lastStatus.trimmed().isEmpty()) {
         m_cells[cellId]->setStatus(session.lastStatus);
     }
@@ -1349,6 +1411,7 @@ void MainWindow::setCameraRecordingRequested(int cameraId, bool requested)
         const auto cameraResult = DBManager::instance().getCameraByCameraId(cameraId);
         if (cameraResult) {
             session.url = QString::fromStdString(cameraResult.value().url).trimmed();
+            session.analysisEnabled = loadCameraAnalysisEnabled(cameraId, m_recordAutoDecodeEnabled);
         }
         session.recordRequested = true;
         m_sessions.insert(cameraId, session);
@@ -1360,6 +1423,189 @@ void MainWindow::setCameraRecordingRequested(int cameraId, bool requested)
     updateStatusBar();
 }
 
+void MainWindow::setCameraAnalysisEnabled(int cameraId, bool enabled)
+{
+    if (cameraId == 0) return;
+
+    auto sessionIt = m_sessions.find(cameraId);
+    if (sessionIt == m_sessions.end()) {
+        if (!enabled) {
+            return;
+        }
+
+        StreamSession session;
+        session.cameraId = cameraId;
+        session.analysisEnabled = enabled;
+
+        const auto cameraResult = DBManager::instance().getCameraByCameraId(cameraId);
+        if (cameraResult) {
+            const auto& camera = cameraResult.value();
+            session.url = QString::fromStdString(camera.url).trimmed();
+            session.recordRequested = camera.record_enabled;
+        }
+
+        m_sessions.insert(cameraId, session);
+    } else {
+        sessionIt->analysisEnabled = enabled;
+        if (!enabled) {
+            sessionIt->analysisBusy = false;
+            sessionIt->lastDetections.clear();
+            sessionIt->lastDetectionFrameSize = cv::Size{};
+            if (sessionIt->worker) {
+                sessionIt->worker->setAnalysisBusy(false);
+            }
+            for (const int cellId : sessionIt->attachedCells) {
+                if (cellId >= 0 && cellId < TOTAL) {
+                    m_cells[cellId]->updateDetections({}, cv::Size{});
+                }
+            }
+        }
+    }
+
+    syncSessionLifetime(cameraId);
+    updateStatusBar();
+}
+
+bool MainWindow::loadCameraAnalysisEnabled(int cameraId, bool defaultValue) const
+{
+    QSettings settings;
+    const QString key = cameraAnalysisSettingKey(cameraId);
+    if (settings.contains(key)) {
+        return settings.value(key).toBool();
+    }
+    return defaultValue;
+}
+
+void MainWindow::saveCameraAnalysisEnabled(int cameraId, bool enabled) const
+{
+    if (cameraId <= 0) {
+        return;
+    }
+
+    QSettings settings;
+    settings.setValue(cameraAnalysisSettingKey(cameraId), enabled);
+    settings.sync();
+}
+
+void MainWindow::ensureInferenceWorkerStarted()
+{
+    if (m_inferenceThreadStarted.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    m_inferenceStopRequested.store(false, std::memory_order_release);
+    m_inferenceThread = std::thread([this]() {
+        Yolov8Inference inference;
+        bool inferenceLoaded = false;
+        try {
+            inference.load(kYoloModelPath);
+            inferenceLoaded = inference.isLoaded() && inference.getExecutionProviderName() == "CUDA";
+        } catch (...) {
+            inferenceLoaded = false;
+        }
+
+        while (!m_inferenceStopRequested.load(std::memory_order_acquire)) {
+            InferenceTask task;
+            {
+                std::unique_lock<std::mutex> lock(m_inferenceQueueMutex);
+                m_inferenceQueueCv.wait(lock, [this]() {
+                    return m_inferenceStopRequested.load(std::memory_order_acquire) || !m_inferenceQueue.empty();
+                });
+
+                if (m_inferenceStopRequested.load(std::memory_order_acquire)) {
+                    break;
+                }
+
+                if (m_inferenceQueue.empty()) {
+                    continue;
+                }
+
+                task = std::move(m_inferenceQueue.front());
+                m_inferenceQueue.pop();
+            }
+
+            std::vector<Yolov8Detection> detections;
+            const cv::Size frameSize = task.frame.size();
+            if (inferenceLoaded && !task.frame.empty()) {
+                try {
+                    detections = inference.inference_cuda(task.frame, 0.25f, 0.45f, true);
+                } catch (...) {
+                    detections.clear();
+                }
+            }
+
+            QMetaObject::invokeMethod(this, [this, cameraId = task.cameraId, detections = std::move(detections), frameSize]() {
+                auto* session = findSession(cameraId);
+                if (!session) {
+                    return;
+                }
+
+                session->analysisBusy = false;
+                if (session->recordRequested && session->analysisEnabled) {
+                    session->lastDetections = detections;
+                    session->lastDetectionFrameSize = frameSize;
+                } else {
+                    session->lastDetections.clear();
+                    session->lastDetectionFrameSize = cv::Size{};
+                }
+
+                if (session->worker) {
+                    session->worker->setAnalysisBusy(false);
+                }
+
+                for (const int cellId : session->attachedCells) {
+                    if (cellId >= 0 && cellId < TOTAL) {
+                        m_cells[cellId]->updateDetections(session->lastDetections, session->lastDetectionFrameSize);
+                    }
+                }
+            }, Qt::QueuedConnection);
+        }
+    });
+
+    m_inferenceThreadStarted.store(true, std::memory_order_release);
+}
+
+void MainWindow::stopInferenceWorker()
+{
+    if (!m_inferenceThreadStarted.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    m_inferenceStopRequested.store(true, std::memory_order_release);
+    m_inferenceQueueCv.notify_all();
+
+    if (m_inferenceThread.joinable()) {
+        m_inferenceThread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_inferenceQueueMutex);
+        std::queue<InferenceTask> empty;
+        m_inferenceQueue.swap(empty);
+    }
+
+    m_inferenceThreadStarted.store(false, std::memory_order_release);
+}
+
+void MainWindow::enqueueInferenceTask(int cameraId, const cv::cuda::GpuMat& frame)
+{
+    if (cameraId == 0 || frame.empty()) {
+        return;
+    }
+
+    ensureInferenceWorkerStarted();
+
+    {
+        std::lock_guard<std::mutex> lock(m_inferenceQueueMutex);
+        if (m_inferenceQueue.size() >= kMaxInferenceQueueDepth) {
+            m_inferenceQueue.pop();
+        }
+        m_inferenceQueue.push(InferenceTask{cameraId, frame});
+    }
+
+    m_inferenceQueueCv.notify_one();
+}
+
 void MainWindow::syncSessionLifetime(int cameraId)
 {
     auto* session = findSession(cameraId);
@@ -1367,8 +1613,8 @@ void MainWindow::syncSessionLifetime(int cameraId)
 
     const QString streamUrl = session->url.trimmed();
     const bool shouldRecord = session->recordRequested;
-    const bool shouldDecode =
-        !session->attachedCells.isEmpty() || (shouldRecord && m_recordAutoDecodeEnabled);
+    const bool shouldAnalyze = shouldRecord && session->analysisEnabled;
+    const bool shouldDecode = !session->attachedCells.isEmpty() || shouldAnalyze;
 
     if (!shouldDecode && session->worker) {
         auto* worker = session->worker;
@@ -1382,6 +1628,7 @@ void MainWindow::syncSessionLifetime(int cameraId)
             worker->wait();
         }
         delete worker;
+        session->analysisBusy = false;
     }
 
     if (!shouldRecord && session->recorder) {
@@ -1398,6 +1645,20 @@ void MainWindow::syncSessionLifetime(int cameraId)
         delete recorder;
     }
 
+    if (!shouldAnalyze) {
+        session->analysisBusy = false;
+        session->lastDetections.clear();
+        session->lastDetectionFrameSize = cv::Size{};
+        if (session->worker) {
+            session->worker->setAnalysisBusy(false);
+        }
+        for (const int cellId : session->attachedCells) {
+            if (cellId >= 0 && cellId < TOTAL) {
+                m_cells[cellId]->updateDetections({}, cv::Size{});
+            }
+        }
+    }
+
     if (streamUrl.isEmpty()) {
         if (!shouldRecord && !shouldDecode && session->attachedCells.isEmpty()) {
             m_sessions.remove(cameraId);
@@ -1412,6 +1673,10 @@ void MainWindow::syncSessionLifetime(int cameraId)
         connect(session->worker, &StreamWorker::statusChanged,
                 this, &MainWindow::onStatusChanged, Qt::QueuedConnection);
         session->worker->start();
+    }
+
+    if (session->worker) {
+        session->worker->setAnalysisBusy(session->analysisBusy);
     }
 
     if (shouldRecord && !session->recorder) {
@@ -1433,6 +1698,10 @@ void MainWindow::syncSessionLifetime(int cameraId)
 
 void MainWindow::stopAndDeleteSession(StreamSession& session)
 {
+    session.analysisBusy = false;
+    session.lastDetections.clear();
+    session.lastDetectionFrameSize = cv::Size{};
+
     if (session.worker) {
         auto* worker = session.worker;
         session.worker = nullptr;
@@ -1523,19 +1792,26 @@ void MainWindow::addCameraListItem(const camera_info& camera)
 
     const QString url = QString::fromStdString(camera.url);
     auto* item = new QListWidgetItem(makeCameraDisplayText(camera), m_streamList);
+    m_streamListItemSyncing = true;
     item->setData(kCameraIdRole, camera.camera_id);
     item->setData(kCameraNameRole, QString::fromStdString(camera.name));
     item->setData(kCameraStreamTypeRole, static_cast<int>(camera.stream_type));
     item->setData(kCameraEnabledRole, camera.enabled);
     item->setData(kCameraRecordEnabledRole, camera.record_enabled);
+    const bool analysisEnabled = loadCameraAnalysisEnabled(camera.camera_id, m_recordAutoDecodeEnabled);
+    item->setData(kCameraAnalysisEnabledRole, analysisEnabled);
+    item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+    item->setCheckState(analysisEnabled ? Qt::Checked : Qt::Unchecked);
     item->setData(kCameraUrlRole, url);
     item->setToolTip(makeCameraTooltip(camera));
     updateCameraItemVisualState(item);
+    m_streamListItemSyncing = false;
 
     // 셀이 없어도 녹화가 켜진 카메라는 세션 수명주기에서 유지될 수 있게 즉시 반영한다.
     if (camera.record_enabled) {
         setCameraRecordingRequested(camera.camera_id, true);
     }
+    setCameraAnalysisEnabled(camera.camera_id, analysisEnabled);
 }
 
 void MainWindow::updateCameraItemVisualState(QListWidgetItem* item)
@@ -1579,6 +1855,10 @@ void MainWindow::resetInlineCameraForm(bool clearSelection)
         const QSignalBlocker blocker(m_recordEnabledButton);
         m_recordEnabledButton->setChecked(false);
         syncRecordButtonText(m_recordEnabledButton, false);
+    }
+    if (m_recordAutoDecodeInput) {
+        const QSignalBlocker blocker(m_recordAutoDecodeInput);
+        m_recordAutoDecodeInput->setChecked(m_recordAutoDecodeEnabled);
     }
 }
 

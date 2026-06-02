@@ -5,9 +5,15 @@
 #include <QSet>
 #include <QGridLayout>
 #include <QString>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <thread>
 #include "videocell.h"
 #include "streamworker.h"
 #include "recorderworker.h"
+#include "yolov8inference.h"
 
 class QLabel;
 class QMenu;
@@ -62,9 +68,18 @@ private:
         QString url;
         QString lastStatus;
         bool recordRequested{false};
+        bool analysisEnabled{false};
+        bool analysisBusy{false};
+        std::vector<Yolov8Detection> lastDetections;
+        cv::Size lastDetectionFrameSize{};
         StreamWorker* worker{nullptr};
         RecorderWorker* recorder{nullptr};
         QSet<int> attachedCells;
+    };
+
+    struct InferenceTask {
+        int cameraId{0};
+        cv::cuda::GpuMat frame;
     };
 
     void buildUi();
@@ -83,10 +98,16 @@ private:
     void bindCellToCamera(int cellId, int cameraId, const QString& url);
     void unbindCell(int cellId);
     void setCameraRecordingRequested(int cameraId, bool requested);
+    void setCameraAnalysisEnabled(int cameraId, bool enabled);
+    bool loadCameraAnalysisEnabled(int cameraId, bool defaultValue) const;
+    void saveCameraAnalysisEnabled(int cameraId, bool enabled) const;
     void syncSessionLifetime(int cameraId);
     void stopAndDeleteSession(StreamSession& session);
     StreamSession* findSession(int cameraId);
     const StreamSession* findSession(int cameraId) const;
+    void ensureInferenceWorkerStarted();
+    void stopInferenceWorker();
+    void enqueueInferenceTask(int cameraId, const cv::cuda::GpuMat& frame);
 
     void loadCameraListFromDB();
     bool saveCameraToDB(const camera_info& camera);
@@ -112,6 +133,7 @@ private:
     QPushButton*             m_recordEnabledButton{nullptr};
     QCheckBox*               m_recordAutoDecodeInput{nullptr};
     bool                     m_recordAutoDecodeEnabled{true};
+    bool                     m_streamListItemSyncing{false};
     QVector<VideoCell*>      m_cells;
     QMap<int, StreamSession> m_sessions;
     QMap<int, int>           m_cellToCamera;
@@ -128,4 +150,11 @@ private:
     int                      m_nextEphemeralCameraId{-1};
     QStackedWidget*          m_stackedMain{nullptr};
     VodPanel*                m_vodPanel{nullptr};
+
+    std::mutex               m_inferenceQueueMutex;
+    std::condition_variable  m_inferenceQueueCv;
+    std::queue<InferenceTask> m_inferenceQueue;
+    std::thread              m_inferenceThread;
+    std::atomic<bool>        m_inferenceStopRequested{false};
+    std::atomic<bool>        m_inferenceThreadStarted{false};
 };
