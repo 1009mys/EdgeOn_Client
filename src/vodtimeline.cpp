@@ -72,10 +72,18 @@ void VodTimeline::setPosition(qint64 posMs) {
 void VodTimeline::clampView() {
     if (m_totalEndMs <= m_totalStartMs) return;
     const qint64 totalDur = m_totalEndMs - m_totalStartMs;
+    if (totalDur <= kMinViewMs) {
+        // 전체 길이가 최소 줌보다 짧으면 qBound(min,max)에서 max<min ASSERT가 발생하므로
+        // 뷰를 전체 구간에 고정한다.
+        m_viewDurationMs = totalDur;
+        m_viewStartMs = m_totalStartMs;
+        return;
+    }
+
     m_viewDurationMs = qBound(kMinViewMs, m_viewDurationMs, totalDur);
-    m_viewStartMs    = qBound(m_totalStartMs,
-                              m_viewStartMs,
-                              m_totalEndMs - m_viewDurationMs);
+    m_viewStartMs = qBound(m_totalStartMs,
+                           m_viewStartMs,
+                           m_totalEndMs - m_viewDurationMs);
 }
 
 qint64 VodTimeline::xToMs(int x) const {

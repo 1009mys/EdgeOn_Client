@@ -108,6 +108,9 @@ std::vector<detection_result> makeDetectionRows(const detection_frame_info& fram
         row.det_index = static_cast<int>(index);
         row.stored_utc_ms = storedUtcMs;
         row.capture_utc_ms = frameInfo.capture_utc_ms > 0 ? frameInfo.capture_utc_ms : frameInfo.frame_utc_ms;
+        row.source_pts = frameInfo.source_pts;
+        row.source_time_base_num = frameInfo.source_time_base_num;
+        row.source_time_base_den = frameInfo.source_time_base_den;
         row.frame_width = frameInfo.frame_width;
         row.frame_height = frameInfo.frame_height;
         row.stream_url = frameInfo.stream_url;
@@ -124,8 +127,12 @@ std::vector<detection_result> makeDetectionRows(const detection_frame_info& fram
         row.box_y = det.box.y;
         row.box_width = det.box.width;
         row.box_height = det.box.height;
+        row.segment_relative_ms = frameInfo.segment_relative_ms;
         row.record_segment_start_utc_ms = frameInfo.record_segment_start_utc_ms;
         row.record_segment_end_utc_ms = frameInfo.record_segment_end_utc_ms;
+        row.record_segment_start_source_pts = frameInfo.record_segment_start_source_pts;
+        row.record_segment_source_time_base_num = frameInfo.record_segment_source_time_base_num;
+        row.record_segment_source_time_base_den = frameInfo.record_segment_source_time_base_den;
         row.record_segment_file_path = frameInfo.record_segment_file_path;
         rows.push_back(std::move(row));
     }
@@ -967,13 +974,27 @@ void MainWindow::onFrameReady(int cameraId) {
     cv::cuda::GpuMat gpuFrame;
     qint64 frameUtcMs = 0;
     qint64 frameSeq = 0;
+    qint64 captureUtcMs = 0;
+    qint64 sourcePts = 0;
+    int sourceTimeBaseNum = 0;
+    int sourceTimeBaseDen = 1;
     cv::Size frameSize;
-    if (session->worker->takeLatestGpuFrame(gpuFrame, frameUtcMs, frameSeq, frameSize)) {
+    if (session->worker->takeLatestGpuFrame(gpuFrame,
+                                            frameUtcMs,
+                                            frameSeq,
+                                            captureUtcMs,
+                                            sourcePts,
+                                            sourceTimeBaseNum,
+                                            sourceTimeBaseDen,
+                                            frameSize)) {
         detection_frame_info frameInfo;
         frameInfo.camera_id = cameraId;
         frameInfo.frame_utc_ms = frameUtcMs;
         frameInfo.frame_seq = frameSeq;
-        frameInfo.capture_utc_ms = frameUtcMs;
+        frameInfo.capture_utc_ms = captureUtcMs > 0 ? captureUtcMs : frameUtcMs;
+        frameInfo.source_pts = sourcePts;
+        frameInfo.source_time_base_num = sourceTimeBaseNum;
+        frameInfo.source_time_base_den = sourceTimeBaseDen > 0 ? sourceTimeBaseDen : 1;
         frameInfo.frame_width = frameSize.width > 0 ? frameSize.width : gpuFrame.cols;
         frameInfo.frame_height = frameSize.height > 0 ? frameSize.height : gpuFrame.rows;
         frameInfo.stream_url = session->url;
@@ -985,9 +1006,24 @@ void MainWindow::onFrameReady(int cameraId) {
         frameInfo.iou_threshold = kInferenceIouThreshold;
         frameInfo.record_requested = session->recordRequested;
         frameInfo.analysis_enabled = session->analysisEnabled;
+        frameInfo.segment_relative_ms = 0;
         frameInfo.record_segment_start_utc_ms = session->recordSegmentStartUtcMs;
         frameInfo.record_segment_end_utc_ms = session->recordSegmentEndUtcMs;
+        frameInfo.record_segment_start_source_pts = session->recordSegmentStartSourcePts;
+        frameInfo.record_segment_source_time_base_num = session->recordSegmentSourceTimeBaseNum;
+        frameInfo.record_segment_source_time_base_den = session->recordSegmentSourceTimeBaseDen;
         frameInfo.record_segment_file_path = session->recordSegmentFilePath;
+
+        if (frameInfo.record_segment_source_time_base_num != 0 &&
+            frameInfo.record_segment_source_time_base_den > 0) {
+            const qint64 deltaPts = frameInfo.source_pts - frameInfo.record_segment_start_source_pts;
+            const long double scaledMs =
+                (static_cast<long double>(deltaPts) *
+                 static_cast<long double>(frameInfo.record_segment_source_time_base_num) *
+                 1000.0L) /
+                static_cast<long double>(frameInfo.record_segment_source_time_base_den);
+            frameInfo.segment_relative_ms = static_cast<qint64>(scaledMs);
+        }
 
         for (const int cellId : session->attachedCells) {
             if (cellId >= 0 && cellId < TOTAL) {
@@ -1006,7 +1042,14 @@ void MainWindow::onFrameReady(int cameraId) {
     }
 
     QImage frame;
-    if (session->worker->takeLatestFrame(frame, frameUtcMs, frameSeq, frameSize)) {
+    if (session->worker->takeLatestFrame(frame,
+                                         frameUtcMs,
+                                         frameSeq,
+                                         captureUtcMs,
+                                         sourcePts,
+                                         sourceTimeBaseNum,
+                                         sourceTimeBaseDen,
+                                         frameSize)) {
         for (const int cellId : session->attachedCells) {
             if (cellId >= 0 && cellId < TOTAL) {
                 m_cells[cellId]->updateFrame(frame);
@@ -1029,31 +1072,22 @@ void MainWindow::onStatusChanged(int cameraId, const QString& status) {
     }
 }
 
-void MainWindow::onRecorderStatusChanged(int cameraId, const QString& status)
-{
-    auto* session = findSession(cameraId);
-    if (!session || !session->recorder) return;
-    if (sender() != session->recorder) return;
-
-    session->lastStatus = status;
-
-    // 디코딩 세션이 없는 녹화 전용 상태에서만 셀 상태 텍스트를 갱신한다.
-    if (!session->worker) {
-        for (const int cellId : session->attachedCells) {
-            if (cellId >= 0 && cellId < TOTAL) {
-                m_cells[cellId]->setStatus(status);
-            }
-        }
-    }
-}
-
-void MainWindow::onRecorderSegmentStarted(int cameraId, qint64 startUtcMs, int segmentSeconds, const QString& tempPath)
+void MainWindow::onRecorderSegmentStarted(int cameraId,
+                                          qint64 startUtcMs,
+                                          int segmentSeconds,
+                                          const QString& tempPath,
+                                          qint64 startSourcePts,
+                                          int sourceTimeBaseNum,
+                                          int sourceTimeBaseDen)
 {
     auto* session = findSession(cameraId);
     if (!session) return;
 
     session->recordSegmentStartUtcMs = startUtcMs;
     session->recordSegmentEndUtcMs = startUtcMs + static_cast<qint64>(qMax(1, segmentSeconds)) * 1000LL;
+    session->recordSegmentStartSourcePts = startSourcePts;
+    session->recordSegmentSourceTimeBaseNum = sourceTimeBaseNum;
+    session->recordSegmentSourceTimeBaseDen = sourceTimeBaseDen > 0 ? sourceTimeBaseDen : 1;
     session->recordSegmentFilePath = tempPath;
 }
 
@@ -1210,6 +1244,16 @@ void MainWindow::removeSelectedStreamAddress() {
 void MainWindow::onStreamListDoubleClicked(QListWidgetItem* item) {
     if (!item) return;
     const int cameraId = item->data(kCameraIdRole).toInt();
+
+    // 저장영상 확인 모드에서는 더블클릭을 VOD 카메라 로드 동작으로 사용한다.
+    if (m_stackedMain && m_stackedMain->currentIndex() == 1) {
+        if (cameraId > 0 && m_vodPanel) {
+            m_vodPanel->loadCamera(cameraId, effectiveRecordSegmentSeconds());
+            m_vodPanel->setFocus();
+        }
+        return;
+    }
+
     const QString url = item->data(kCameraUrlRole).toString().trimmed().isEmpty()
                             ? item->text().trimmed()
                             : item->data(kCameraUrlRole).toString().trimmed();
@@ -1460,11 +1504,29 @@ void MainWindow::bindCellToCamera(int cellId, int cameraId, const QString& url)
         qint64 frameUtcMs = 0;
         qint64 frameSeq = 0;
         cv::Size frameSize;
-        if (session.worker->takeLatestGpuFrame(gpuFrame, frameUtcMs, frameSeq, frameSize)) {
+        qint64 captureUtcMs = 0;
+        qint64 sourcePts = 0;
+        int sourceTimeBaseNum = 0;
+        int sourceTimeBaseDen = 1;
+        if (session.worker->takeLatestGpuFrame(gpuFrame,
+                                               frameUtcMs,
+                                               frameSeq,
+                                               captureUtcMs,
+                                               sourcePts,
+                                               sourceTimeBaseNum,
+                                               sourceTimeBaseDen,
+                                               frameSize)) {
             m_cells[cellId]->updateGpuFrame(gpuFrame);
         } else {
             QImage frame;
-            if (session.worker->takeLatestFrame(frame, frameUtcMs, frameSeq, frameSize)) {
+            if (session.worker->takeLatestFrame(frame,
+                                                frameUtcMs,
+                                                frameSeq,
+                                                captureUtcMs,
+                                                sourcePts,
+                                                sourceTimeBaseNum,
+                                                sourceTimeBaseDen,
+                                                frameSize)) {
                 m_cells[cellId]->updateFrame(frame);
             }
         }
@@ -1519,6 +1581,9 @@ void MainWindow::setCameraRecordingRequested(int cameraId, bool requested)
         if (!requested) {
             sessionIt->recordSegmentStartUtcMs = 0;
             sessionIt->recordSegmentEndUtcMs = 0;
+            sessionIt->recordSegmentStartSourcePts = 0;
+            sessionIt->recordSegmentSourceTimeBaseNum = 0;
+            sessionIt->recordSegmentSourceTimeBaseDen = 1;
             sessionIt->recordSegmentFilePath.clear();
         }
     }
@@ -1672,7 +1737,8 @@ void MainWindow::ensureInferenceWorkerStarted()
                         qWarning() << "Detection 저장 실패:" << dbResult.error();
                     }
                 } else if (session->recordRequested && session->analysisEnabled) {
-                    const auto dbResult = DBManager::instance().saveDetectionResults(frameInfo, {});
+                    const std::vector<detection_result> emptyRows;
+                    const auto dbResult = DBManager::instance().saveDetectionResults(frameInfo, emptyRows);
                     if (!dbResult) {
                         qWarning() << "빈 Detection 프레임 저장 실패:" << dbResult.error();
                     }
@@ -1743,7 +1809,7 @@ void MainWindow::syncSessionLifetime(int cameraId)
     const QString streamUrl = session->url.trimmed();
     const bool shouldRecord = session->recordRequested;
     const bool shouldAnalyze = shouldRecord && session->analysisEnabled;
-    const bool shouldDecode = !session->attachedCells.isEmpty() || shouldAnalyze;
+    const bool shouldDecode = !session->attachedCells.isEmpty() || shouldAnalyze || shouldRecord;
 
     if (!shouldDecode && session->worker) {
         auto* worker = session->worker;
@@ -1758,23 +1824,6 @@ void MainWindow::syncSessionLifetime(int cameraId)
         }
         delete worker;
         session->analysisBusy = false;
-    }
-
-    if (!shouldRecord && session->recorder) {
-        auto* recorder = session->recorder;
-        session->recorder = nullptr;
-        disconnect(recorder, nullptr, this, nullptr);
-        recorder->stop();
-        if (recorder->isRunning()) {
-            recorder->wait(5000);
-        }
-        if (recorder->isRunning()) {
-            recorder->wait();
-        }
-        delete recorder;
-        session->recordSegmentStartUtcMs = 0;
-        session->recordSegmentEndUtcMs = 0;
-        session->recordSegmentFilePath.clear();
     }
 
     if (!shouldAnalyze) {
@@ -1799,32 +1848,34 @@ void MainWindow::syncSessionLifetime(int cameraId)
     }
 
     if (shouldDecode && !session->worker) {
-        session->worker = new StreamWorker(cameraId, streamUrl, this);
+        const int segmentSeconds = effectiveRecordSegmentSeconds();
+        session->worker = new StreamWorker(cameraId,
+                                           streamUrl,
+                                           QString::fromUtf8(kRecordOutputRoot),
+                                           segmentSeconds,
+                                           this);
         connect(session->worker, &StreamWorker::frameReady,
                 this, &MainWindow::onFrameReady, Qt::QueuedConnection);
         connect(session->worker, &StreamWorker::statusChanged,
                 this, &MainWindow::onStatusChanged, Qt::QueuedConnection);
+        connect(session->worker, &StreamWorker::segmentStarted,
+                this, &MainWindow::onRecorderSegmentStarted, Qt::QueuedConnection);
+        connect(session->worker, &StreamWorker::segmentFinished,
+                this, &MainWindow::onRecorderSegmentFinished, Qt::QueuedConnection);
         session->worker->start();
     }
 
     if (session->worker) {
         session->worker->setAnalysisBusy(session->analysisBusy);
-    }
-
-    if (shouldRecord && !session->recorder) {
-        const int segmentSeconds = effectiveRecordSegmentSeconds();
-        session->recorder = new RecorderWorker(cameraId,
-                                               streamUrl,
-                                               QString::fromUtf8(kRecordOutputRoot),
-                                               segmentSeconds,
-                                               this);
-        connect(session->recorder, &RecorderWorker::statusChanged,
-                this, &MainWindow::onRecorderStatusChanged, Qt::QueuedConnection);
-        connect(session->recorder, &RecorderWorker::segmentStarted,
-                this, &MainWindow::onRecorderSegmentStarted, Qt::QueuedConnection);
-        connect(session->recorder, &RecorderWorker::segmentFinished,
-                this, &MainWindow::onRecorderSegmentFinished, Qt::QueuedConnection);
-        session->recorder->start();
+        session->worker->setRecordingEnabled(shouldRecord);
+        if (!shouldRecord) {
+            session->recordSegmentStartUtcMs = 0;
+            session->recordSegmentEndUtcMs = 0;
+            session->recordSegmentStartSourcePts = 0;
+            session->recordSegmentSourceTimeBaseNum = 0;
+            session->recordSegmentSourceTimeBaseDen = 1;
+            session->recordSegmentFilePath.clear();
+        }
     }
 
     if (!shouldRecord && !shouldDecode && session->attachedCells.isEmpty()) {
@@ -1839,6 +1890,9 @@ void MainWindow::stopAndDeleteSession(StreamSession& session)
     session.lastDetectionFrameSize = cv::Size{};
     session.recordSegmentStartUtcMs = 0;
     session.recordSegmentEndUtcMs = 0;
+    session.recordSegmentStartSourcePts = 0;
+    session.recordSegmentSourceTimeBaseNum = 0;
+    session.recordSegmentSourceTimeBaseDen = 1;
     session.recordSegmentFilePath.clear();
 
     if (session.worker) {
@@ -1856,20 +1910,6 @@ void MainWindow::stopAndDeleteSession(StreamSession& session)
         delete worker;
     }
 
-    if (session.recorder) {
-        auto* recorder = session.recorder;
-        session.recorder = nullptr;
-
-        disconnect(recorder, nullptr, this, nullptr);
-        recorder->stop();
-        if (recorder->isRunning()) {
-            recorder->wait(5000);
-        }
-        if (recorder->isRunning()) {
-            recorder->wait();
-        }
-        delete recorder;
-    }
 }
 
 MainWindow::StreamSession* MainWindow::findSession(int cameraId)

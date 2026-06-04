@@ -58,8 +58,19 @@ void DBManager::initialize()
     if (fileExisted) {
         // 파일이 이미 있는 경우 → 내부 스키마 검증
         if (const auto result = validateDB(); !result) {
-            qCritical() << "DB 검증 실패:" << result.error();
-            return;
+            qWarning() << "DB 검증 실패(복구 시도):" << result.error();
+            QSqlQuery rebuildQuery(db);
+            static_cast<void>(rebuildQuery.exec("DROP VIEW IF EXISTS v_detection_results"));
+            static_cast<void>(rebuildQuery.exec("DROP TABLE IF EXISTS detections"));
+            static_cast<void>(rebuildQuery.exec("DROP TABLE IF EXISTS detection_frames"));
+            if (const auto createResult = createDetectionTables(); !createResult) {
+                qCritical() << "Detection 테이블 복구 실패:" << createResult.error();
+                return;
+            }
+            if (const auto retry = validateDB(); !retry) {
+                qCritical() << "DB 검증 실패:" << retry.error();
+                return;
+            }
         }
         qDebug() << "기존 DB 검증 성공!";
     } else {

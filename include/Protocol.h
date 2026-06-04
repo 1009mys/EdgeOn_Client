@@ -29,6 +29,9 @@ struct detection_frame_info {
     qint64  frame_utc_ms{0};
     qint64  frame_seq{0};
     qint64  capture_utc_ms{0};
+    qint64  source_pts{0};
+    int     source_time_base_num{0};
+    int     source_time_base_den{1};
     int     frame_width{0};
     int     frame_height{0};
     QString stream_url;
@@ -42,8 +45,12 @@ struct detection_frame_info {
     int     detection_count{0};
     bool    record_requested{false};
     bool    analysis_enabled{false};
+    qint64  segment_relative_ms{0};
     qint64  record_segment_start_utc_ms{0};
     qint64  record_segment_end_utc_ms{0};
+    qint64  record_segment_start_source_pts{0};
+    int     record_segment_source_time_base_num{0};
+    int     record_segment_source_time_base_den{1};
     QString record_segment_file_path;
 };
 
@@ -54,6 +61,9 @@ struct detection_result {
     int     det_index{0};
     qint64  stored_utc_ms{0};
     qint64  capture_utc_ms{0};
+    qint64  source_pts{0};
+    int     source_time_base_num{0};
+    int     source_time_base_den{1};
     int     frame_width{0};
     int     frame_height{0};
     QString stream_url;
@@ -70,8 +80,12 @@ struct detection_result {
     float   box_y{0.0f};
     float   box_width{0.0f};
     float   box_height{0.0f};
+    qint64  segment_relative_ms{0};
     qint64  record_segment_start_utc_ms{0};
     qint64  record_segment_end_utc_ms{0};
+    qint64  record_segment_start_source_pts{0};
+    int     record_segment_source_time_base_num{0};
+    int     record_segment_source_time_base_den{1};
     QString record_segment_file_path;
 };
 

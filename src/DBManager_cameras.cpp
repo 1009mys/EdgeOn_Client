@@ -105,12 +105,26 @@ std::expected<void, QString> DBManager::createDetectionTables()
 {
     QSqlQuery query(db);
 
+    // 공통 timestamp 스키마로 강제 전환한다. (기존 테이블/데이터 비보존)
+    if (!query.exec("DROP VIEW IF EXISTS v_detection_results")) {
+        return std::unexpected(query.lastError().text());
+    }
+    if (!query.exec("DROP TABLE IF EXISTS detections")) {
+        return std::unexpected(query.lastError().text());
+    }
+    if (!query.exec("DROP TABLE IF EXISTS detection_frames")) {
+        return std::unexpected(query.lastError().text());
+    }
+
     const QString createFramesTable = R"(
         CREATE TABLE IF NOT EXISTS detection_frames (
             camera_id                   INTEGER NOT NULL,
             frame_utc_ms                INTEGER NOT NULL,
             frame_seq                   INTEGER NOT NULL,
             capture_utc_ms              INTEGER NOT NULL,
+            source_pts                  INTEGER NOT NULL DEFAULT 0,
+            source_time_base_num        INTEGER NOT NULL DEFAULT 0,
+            source_time_base_den        INTEGER NOT NULL DEFAULT 1,
             stored_utc_ms               INTEGER NOT NULL,
             frame_width                 INTEGER NOT NULL,
             frame_height                INTEGER NOT NULL,
@@ -125,8 +139,12 @@ std::expected<void, QString> DBManager::createDetectionTables()
             detection_count             INTEGER NOT NULL,
             record_requested            INTEGER NOT NULL DEFAULT 0,
             analysis_enabled            INTEGER NOT NULL DEFAULT 0,
+            segment_relative_ms         INTEGER NOT NULL DEFAULT 0,
             record_segment_start_utc_ms INTEGER NOT NULL DEFAULT 0,
             record_segment_end_utc_ms   INTEGER NOT NULL DEFAULT 0,
+            record_segment_start_source_pts INTEGER NOT NULL DEFAULT 0,
+            record_segment_source_time_base_num INTEGER NOT NULL DEFAULT 0,
+            record_segment_source_time_base_den INTEGER NOT NULL DEFAULT 1,
             record_segment_file_path    TEXT    NOT NULL DEFAULT '',
             PRIMARY KEY (camera_id, frame_utc_ms, frame_seq)
         ) WITHOUT ROWID
@@ -140,6 +158,9 @@ std::expected<void, QString> DBManager::createDetectionTables()
             det_index                   INTEGER NOT NULL,
             stored_utc_ms               INTEGER NOT NULL,
             capture_utc_ms              INTEGER NOT NULL,
+            source_pts                  INTEGER NOT NULL DEFAULT 0,
+            source_time_base_num        INTEGER NOT NULL DEFAULT 0,
+            source_time_base_den        INTEGER NOT NULL DEFAULT 1,
             frame_width                 INTEGER NOT NULL,
             frame_height                INTEGER NOT NULL,
             stream_url                  TEXT    NOT NULL,
@@ -156,8 +177,12 @@ std::expected<void, QString> DBManager::createDetectionTables()
             box_y                       REAL    NOT NULL,
             box_width                   REAL    NOT NULL,
             box_height                  REAL    NOT NULL,
+            segment_relative_ms         INTEGER NOT NULL DEFAULT 0,
             record_segment_start_utc_ms INTEGER NOT NULL DEFAULT 0,
             record_segment_end_utc_ms   INTEGER NOT NULL DEFAULT 0,
+            record_segment_start_source_pts INTEGER NOT NULL DEFAULT 0,
+            record_segment_source_time_base_num INTEGER NOT NULL DEFAULT 0,
+            record_segment_source_time_base_den INTEGER NOT NULL DEFAULT 1,
             record_segment_file_path    TEXT    NOT NULL DEFAULT '',
             PRIMARY KEY (camera_id, frame_utc_ms, frame_seq, det_index),
             FOREIGN KEY (camera_id, frame_utc_ms, frame_seq)
@@ -173,6 +198,9 @@ std::expected<void, QString> DBManager::createDetectionTables()
             f.frame_utc_ms,
             f.frame_seq,
             f.capture_utc_ms,
+            f.source_pts,
+            f.source_time_base_num,
+            f.source_time_base_den,
             f.stored_utc_ms,
             f.frame_width,
             f.frame_height,
@@ -187,8 +215,12 @@ std::expected<void, QString> DBManager::createDetectionTables()
             f.detection_count,
             f.record_requested,
             f.analysis_enabled,
+            f.segment_relative_ms,
             f.record_segment_start_utc_ms,
             f.record_segment_end_utc_ms,
+            f.record_segment_start_source_pts,
+            f.record_segment_source_time_base_num,
+            f.record_segment_source_time_base_den,
             f.record_segment_file_path,
             d.det_index,
             d.class_id,
@@ -229,11 +261,13 @@ std::expected<void, QString> DBManager::validateDetectionTables()
     }
 
     const QStringList frameColumns = {
-        "camera_id", "frame_utc_ms", "frame_seq", "capture_utc_ms", "stored_utc_ms",
+        "camera_id", "frame_utc_ms", "frame_seq", "capture_utc_ms", "source_pts", "source_time_base_num", "source_time_base_den", "stored_utc_ms",
         "frame_width", "frame_height", "stream_url", "model_name", "model_provider",
         "model_input_width", "model_input_height", "confidence_threshold", "iou_threshold",
         "inference_ms", "detection_count", "record_requested", "analysis_enabled",
-        "record_segment_start_utc_ms", "record_segment_end_utc_ms", "record_segment_file_path"
+        "segment_relative_ms", "record_segment_start_utc_ms", "record_segment_end_utc_ms",
+        "record_segment_start_source_pts", "record_segment_source_time_base_num",
+        "record_segment_source_time_base_den", "record_segment_file_path"
     };
 
     if (!query.exec("PRAGMA table_info(detection_frames)")) {
@@ -258,11 +292,13 @@ std::expected<void, QString> DBManager::validateDetectionTables()
     }
 
     const QStringList detectionColumns = {
-        "camera_id", "frame_utc_ms", "frame_seq", "det_index", "stored_utc_ms", "capture_utc_ms",
+        "camera_id", "frame_utc_ms", "frame_seq", "det_index", "stored_utc_ms", "capture_utc_ms", "source_pts", "source_time_base_num", "source_time_base_den",
         "frame_width", "frame_height", "stream_url", "model_name", "model_provider",
         "model_input_width", "model_input_height", "confidence_threshold", "iou_threshold",
         "inference_ms", "class_id", "score", "box_x", "box_y", "box_width", "box_height",
-        "record_segment_start_utc_ms", "record_segment_end_utc_ms", "record_segment_file_path"
+        "segment_relative_ms", "record_segment_start_utc_ms", "record_segment_end_utc_ms",
+        "record_segment_start_source_pts", "record_segment_source_time_base_num",
+        "record_segment_source_time_base_den", "record_segment_file_path"
     };
 
     if (!query.exec("PRAGMA table_info(detections)")) {
@@ -314,17 +350,23 @@ std::expected<void, QString> DBManager::saveDetectionResults(const detection_fra
     QSqlQuery frameQuery(db);
     if (!frameQuery.prepare(R"(
         INSERT OR REPLACE INTO detection_frames (
-            camera_id, frame_utc_ms, frame_seq, capture_utc_ms, stored_utc_ms,
+            camera_id, frame_utc_ms, frame_seq, capture_utc_ms, source_pts, source_time_base_num, source_time_base_den, stored_utc_ms,
             frame_width, frame_height, stream_url, model_name, model_provider,
             model_input_width, model_input_height, confidence_threshold, iou_threshold,
             inference_ms, detection_count, record_requested, analysis_enabled,
-            record_segment_start_utc_ms, record_segment_end_utc_ms, record_segment_file_path
+            segment_relative_ms,
+            record_segment_start_utc_ms, record_segment_end_utc_ms,
+            record_segment_start_source_pts, record_segment_source_time_base_num, record_segment_source_time_base_den,
+            record_segment_file_path
         ) VALUES (
-            :camera_id, :frame_utc_ms, :frame_seq, :capture_utc_ms, :stored_utc_ms,
+            :camera_id, :frame_utc_ms, :frame_seq, :capture_utc_ms, :source_pts, :source_time_base_num, :source_time_base_den, :stored_utc_ms,
             :frame_width, :frame_height, :stream_url, :model_name, :model_provider,
             :model_input_width, :model_input_height, :confidence_threshold, :iou_threshold,
             :inference_ms, :detection_count, :record_requested, :analysis_enabled,
-            :record_segment_start_utc_ms, :record_segment_end_utc_ms, :record_segment_file_path
+            :segment_relative_ms,
+            :record_segment_start_utc_ms, :record_segment_end_utc_ms,
+            :record_segment_start_source_pts, :record_segment_source_time_base_num, :record_segment_source_time_base_den,
+            :record_segment_file_path
         )
     )")) {
         rollbackOnError();
@@ -335,6 +377,9 @@ std::expected<void, QString> DBManager::saveDetectionResults(const detection_fra
     frameQuery.bindValue(":frame_utc_ms", frameInfo.frame_utc_ms);
     frameQuery.bindValue(":frame_seq", static_cast<qint64>(frameInfo.frame_seq));
     frameQuery.bindValue(":capture_utc_ms", frameInfo.capture_utc_ms > 0 ? frameInfo.capture_utc_ms : frameInfo.frame_utc_ms);
+    frameQuery.bindValue(":source_pts", frameInfo.source_pts);
+    frameQuery.bindValue(":source_time_base_num", frameInfo.source_time_base_num);
+    frameQuery.bindValue(":source_time_base_den", frameInfo.source_time_base_den <= 0 ? 1 : frameInfo.source_time_base_den);
     frameQuery.bindValue(":stored_utc_ms", storedUtcMs);
     frameQuery.bindValue(":frame_width", frameInfo.frame_width);
     frameQuery.bindValue(":frame_height", frameInfo.frame_height);
@@ -349,8 +394,12 @@ std::expected<void, QString> DBManager::saveDetectionResults(const detection_fra
     frameQuery.bindValue(":detection_count", frameInfo.detection_count);
     frameQuery.bindValue(":record_requested", frameInfo.record_requested ? 1 : 0);
     frameQuery.bindValue(":analysis_enabled", frameInfo.analysis_enabled ? 1 : 0);
+    frameQuery.bindValue(":segment_relative_ms", frameInfo.segment_relative_ms);
     frameQuery.bindValue(":record_segment_start_utc_ms", frameInfo.record_segment_start_utc_ms);
     frameQuery.bindValue(":record_segment_end_utc_ms", frameInfo.record_segment_end_utc_ms);
+    frameQuery.bindValue(":record_segment_start_source_pts", frameInfo.record_segment_start_source_pts);
+    frameQuery.bindValue(":record_segment_source_time_base_num", frameInfo.record_segment_source_time_base_num);
+    frameQuery.bindValue(":record_segment_source_time_base_den", frameInfo.record_segment_source_time_base_den <= 0 ? 1 : frameInfo.record_segment_source_time_base_den);
     frameQuery.bindValue(":record_segment_file_path", frameInfo.record_segment_file_path);
 
     if (!frameQuery.exec()) {
@@ -362,17 +411,23 @@ std::expected<void, QString> DBManager::saveDetectionResults(const detection_fra
         QSqlQuery detectionQuery(db);
         if (!detectionQuery.prepare(R"(
             INSERT OR REPLACE INTO detections (
-                camera_id, frame_utc_ms, frame_seq, det_index, stored_utc_ms, capture_utc_ms,
+                camera_id, frame_utc_ms, frame_seq, det_index, stored_utc_ms, capture_utc_ms, source_pts, source_time_base_num, source_time_base_den,
                 frame_width, frame_height, stream_url, model_name, model_provider,
                 model_input_width, model_input_height, confidence_threshold, iou_threshold,
                 inference_ms, class_id, score, box_x, box_y, box_width, box_height,
-                record_segment_start_utc_ms, record_segment_end_utc_ms, record_segment_file_path
+                segment_relative_ms,
+                record_segment_start_utc_ms, record_segment_end_utc_ms,
+                record_segment_start_source_pts, record_segment_source_time_base_num, record_segment_source_time_base_den,
+                record_segment_file_path
             ) VALUES (
-                :camera_id, :frame_utc_ms, :frame_seq, :det_index, :stored_utc_ms, :capture_utc_ms,
+                :camera_id, :frame_utc_ms, :frame_seq, :det_index, :stored_utc_ms, :capture_utc_ms, :source_pts, :source_time_base_num, :source_time_base_den,
                 :frame_width, :frame_height, :stream_url, :model_name, :model_provider,
                 :model_input_width, :model_input_height, :confidence_threshold, :iou_threshold,
                 :inference_ms, :class_id, :score, :box_x, :box_y, :box_width, :box_height,
-                :record_segment_start_utc_ms, :record_segment_end_utc_ms, :record_segment_file_path
+                :segment_relative_ms,
+                :record_segment_start_utc_ms, :record_segment_end_utc_ms,
+                :record_segment_start_source_pts, :record_segment_source_time_base_num, :record_segment_source_time_base_den,
+                :record_segment_file_path
             )
         )")) {
             rollbackOnError();
@@ -386,6 +441,9 @@ std::expected<void, QString> DBManager::saveDetectionResults(const detection_fra
             detectionQuery.bindValue(":det_index", det.det_index);
             detectionQuery.bindValue(":stored_utc_ms", det.stored_utc_ms > 0 ? det.stored_utc_ms : storedUtcMs);
             detectionQuery.bindValue(":capture_utc_ms", det.capture_utc_ms > 0 ? det.capture_utc_ms : frameInfo.capture_utc_ms);
+            detectionQuery.bindValue(":source_pts", det.source_pts != 0 ? det.source_pts : frameInfo.source_pts);
+            detectionQuery.bindValue(":source_time_base_num", det.source_time_base_num != 0 ? det.source_time_base_num : frameInfo.source_time_base_num);
+            detectionQuery.bindValue(":source_time_base_den", det.source_time_base_den > 0 ? det.source_time_base_den : (frameInfo.source_time_base_den <= 0 ? 1 : frameInfo.source_time_base_den));
             detectionQuery.bindValue(":frame_width", det.frame_width > 0 ? det.frame_width : frameInfo.frame_width);
             detectionQuery.bindValue(":frame_height", det.frame_height > 0 ? det.frame_height : frameInfo.frame_height);
             detectionQuery.bindValue(":stream_url", det.stream_url.isEmpty() ? frameInfo.stream_url : det.stream_url);
@@ -402,12 +460,22 @@ std::expected<void, QString> DBManager::saveDetectionResults(const detection_fra
             detectionQuery.bindValue(":box_y", det.box_y);
             detectionQuery.bindValue(":box_width", det.box_width);
             detectionQuery.bindValue(":box_height", det.box_height);
+            detectionQuery.bindValue(":segment_relative_ms", det.segment_relative_ms != 0 ? det.segment_relative_ms : frameInfo.segment_relative_ms);
             detectionQuery.bindValue(":record_segment_start_utc_ms",
                                      det.record_segment_start_utc_ms > 0 ? det.record_segment_start_utc_ms
                                                                         : frameInfo.record_segment_start_utc_ms);
             detectionQuery.bindValue(":record_segment_end_utc_ms",
                                      det.record_segment_end_utc_ms > 0 ? det.record_segment_end_utc_ms
                                                                        : frameInfo.record_segment_end_utc_ms);
+            detectionQuery.bindValue(":record_segment_start_source_pts",
+                                     det.record_segment_start_source_pts != 0 ? det.record_segment_start_source_pts
+                                                                              : frameInfo.record_segment_start_source_pts);
+            detectionQuery.bindValue(":record_segment_source_time_base_num",
+                                     det.record_segment_source_time_base_num != 0 ? det.record_segment_source_time_base_num
+                                                                                  : frameInfo.record_segment_source_time_base_num);
+            detectionQuery.bindValue(":record_segment_source_time_base_den",
+                                     det.record_segment_source_time_base_den > 0 ? det.record_segment_source_time_base_den
+                                                                                : (frameInfo.record_segment_source_time_base_den <= 0 ? 1 : frameInfo.record_segment_source_time_base_den));
             detectionQuery.bindValue(":record_segment_file_path",
                                      det.record_segment_file_path.isEmpty() ? frameInfo.record_segment_file_path
                                                                             : det.record_segment_file_path);
@@ -475,6 +543,9 @@ std::expected<std::vector<detection_frame_group>, QString> DBManager::listDetect
             f.frame_utc_ms,
             f.frame_seq,
             f.capture_utc_ms,
+            f.source_pts,
+            f.source_time_base_num,
+            f.source_time_base_den,
             f.stored_utc_ms,
             f.frame_width,
             f.frame_height,
@@ -489,8 +560,12 @@ std::expected<std::vector<detection_frame_group>, QString> DBManager::listDetect
             f.detection_count,
             f.record_requested,
             f.analysis_enabled,
+            f.segment_relative_ms,
             f.record_segment_start_utc_ms,
             f.record_segment_end_utc_ms,
+            f.record_segment_start_source_pts,
+            f.record_segment_source_time_base_num,
+            f.record_segment_source_time_base_den,
             f.record_segment_file_path,
             d.det_index,
             d.class_id,
@@ -498,15 +573,19 @@ std::expected<std::vector<detection_frame_group>, QString> DBManager::listDetect
             d.box_x,
             d.box_y,
             d.box_width,
-            d.box_height
+            d.box_height,
+            d.segment_relative_ms,
+            d.record_segment_start_source_pts,
+            d.record_segment_source_time_base_num,
+            d.record_segment_source_time_base_den
         FROM detection_frames AS f
         LEFT JOIN detections AS d
                ON d.camera_id = f.camera_id
               AND d.frame_utc_ms = f.frame_utc_ms
               AND d.frame_seq = f.frame_seq
         WHERE f.camera_id = :camera_id
-          AND f.frame_utc_ms >= :start_utc_ms
-          AND f.frame_utc_ms <= :end_utc_ms
+          AND f.capture_utc_ms >= :start_utc_ms
+          AND f.capture_utc_ms <= :end_utc_ms
         ORDER BY f.frame_utc_ms ASC, f.frame_seq ASC, d.det_index ASC
     )")) {
         return std::unexpected(query.lastError().text());
@@ -534,29 +613,36 @@ std::expected<std::vector<detection_frame_group>, QString> DBManager::listDetect
             group.frame.frame_utc_ms = frameUtcMs;
             group.frame.frame_seq = frameSeq;
             group.frame.capture_utc_ms = query.value(3).toLongLong();
-            group.frame.frame_width = query.value(5).toInt();
-            group.frame.frame_height = query.value(6).toInt();
-            group.frame.stream_url = query.value(7).toString();
-            group.frame.model_name = query.value(8).toString();
-            group.frame.model_provider = query.value(9).toString();
-            group.frame.model_input_width = query.value(10).toInt();
-            group.frame.model_input_height = query.value(11).toInt();
-            group.frame.confidence_threshold = query.value(12).toFloat();
-            group.frame.iou_threshold = query.value(13).toFloat();
-            group.frame.inference_ms = query.value(14).toDouble();
-            group.frame.detection_count = query.value(15).toInt();
-            group.frame.record_requested = query.value(16).toInt() != 0;
-            group.frame.analysis_enabled = query.value(17).toInt() != 0;
-            group.frame.record_segment_start_utc_ms = query.value(18).toLongLong();
-            group.frame.record_segment_end_utc_ms = query.value(19).toLongLong();
-            group.frame.record_segment_file_path = query.value(20).toString();
+            group.frame.source_pts = query.value(4).toLongLong();
+            group.frame.source_time_base_num = query.value(5).toInt();
+            group.frame.source_time_base_den = query.value(6).toInt();
+            group.frame.frame_width = query.value(8).toInt();
+            group.frame.frame_height = query.value(9).toInt();
+            group.frame.stream_url = query.value(10).toString();
+            group.frame.model_name = query.value(11).toString();
+            group.frame.model_provider = query.value(12).toString();
+            group.frame.model_input_width = query.value(13).toInt();
+            group.frame.model_input_height = query.value(14).toInt();
+            group.frame.confidence_threshold = query.value(15).toFloat();
+            group.frame.iou_threshold = query.value(16).toFloat();
+            group.frame.inference_ms = query.value(17).toDouble();
+            group.frame.detection_count = query.value(18).toInt();
+            group.frame.record_requested = query.value(19).toInt() != 0;
+            group.frame.analysis_enabled = query.value(20).toInt() != 0;
+            group.frame.segment_relative_ms = query.value(21).toLongLong();
+            group.frame.record_segment_start_utc_ms = query.value(22).toLongLong();
+            group.frame.record_segment_end_utc_ms = query.value(23).toLongLong();
+            group.frame.record_segment_start_source_pts = query.value(24).toLongLong();
+            group.frame.record_segment_source_time_base_num = query.value(25).toInt();
+            group.frame.record_segment_source_time_base_den = query.value(26).toInt();
+            group.frame.record_segment_file_path = query.value(27).toString();
 
             groups.push_back(std::move(group));
             currentFrameUtcMs = frameUtcMs;
             currentFrameSeq = frameSeq;
         }
 
-        if (query.isNull(21)) {
+        if (query.isNull(28)) {
             continue;
         }
 
@@ -564,27 +650,34 @@ std::expected<std::vector<detection_frame_group>, QString> DBManager::listDetect
         det.camera_id = query.value(0).toInt();
         det.frame_utc_ms = frameUtcMs;
         det.frame_seq = frameSeq;
-        det.det_index = query.value(21).toInt();
+        det.det_index = query.value(28).toInt();
         det.capture_utc_ms = query.value(3).toLongLong();
-        det.frame_width = query.value(5).toInt();
-        det.frame_height = query.value(6).toInt();
-        det.stream_url = query.value(7).toString();
-        det.model_name = query.value(8).toString();
-        det.model_provider = query.value(9).toString();
-        det.model_input_width = query.value(10).toInt();
-        det.model_input_height = query.value(11).toInt();
-        det.confidence_threshold = query.value(12).toFloat();
-        det.iou_threshold = query.value(13).toFloat();
-        det.inference_ms = query.value(14).toDouble();
-        det.class_id = query.value(22).toInt();
-        det.score = query.value(23).toFloat();
-        det.box_x = query.value(24).toFloat();
-        det.box_y = query.value(25).toFloat();
-        det.box_width = query.value(26).toFloat();
-        det.box_height = query.value(27).toFloat();
-        det.record_segment_start_utc_ms = query.value(18).toLongLong();
-        det.record_segment_end_utc_ms = query.value(19).toLongLong();
-        det.record_segment_file_path = query.value(20).toString();
+        det.source_pts = query.value(4).toLongLong();
+        det.source_time_base_num = query.value(5).toInt();
+        det.source_time_base_den = query.value(6).toInt();
+        det.frame_width = query.value(8).toInt();
+        det.frame_height = query.value(9).toInt();
+        det.stream_url = query.value(10).toString();
+        det.model_name = query.value(11).toString();
+        det.model_provider = query.value(12).toString();
+        det.model_input_width = query.value(13).toInt();
+        det.model_input_height = query.value(14).toInt();
+        det.confidence_threshold = query.value(15).toFloat();
+        det.iou_threshold = query.value(16).toFloat();
+        det.inference_ms = query.value(17).toDouble();
+        det.class_id = query.value(29).toInt();
+        det.score = query.value(30).toFloat();
+        det.box_x = query.value(31).toFloat();
+        det.box_y = query.value(32).toFloat();
+        det.box_width = query.value(33).toFloat();
+        det.box_height = query.value(34).toFloat();
+        det.segment_relative_ms = query.value(35).toLongLong();
+        det.record_segment_start_utc_ms = query.value(22).toLongLong();
+        det.record_segment_end_utc_ms = query.value(23).toLongLong();
+        det.record_segment_start_source_pts = query.value(36).toLongLong();
+        det.record_segment_source_time_base_num = query.value(37).toInt();
+        det.record_segment_source_time_base_den = query.value(38).toInt();
+        det.record_segment_file_path = query.value(27).toString();
 
         groups.back().detections.push_back(std::move(det));
     }

@@ -3,6 +3,7 @@ project(EdgeOn_Client LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 include(GNUInstallDirs)
 
@@ -56,6 +57,7 @@ endif ()
 
 set(FFMPEG_BIN_DIR "C:/ffmpeg/ffmpeg-master-latest-win64-gpl-shared/bin" CACHE PATH "Directory containing ffmpeg.exe and runtime DLLs")
 set(FFMPEG_EXECUTABLE "" CACHE FILEPATH "Path to ffmpeg executable for recorder (optional, overrides FFMPEG_BIN_DIR)")
+set(FFMPEG_ROOT "" CACHE PATH "FFmpeg root containing include/ and lib/ for C API linkage")
 set(ONNXRUNTIME_ROOT "C:/onnxruntime/onnxruntime-win-x64-gpu-1.26.0" CACHE PATH "Path to ONNX Runtime root")
 
 set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/include")
@@ -69,6 +71,14 @@ if(WIN32)
         endif()
     endif()
 endif()
+
+if(NOT FFMPEG_ROOT AND FFMPEG_BIN_DIR)
+    get_filename_component(_ffmpeg_parent "${FFMPEG_BIN_DIR}" DIRECTORY)
+    set(FFMPEG_ROOT "${_ffmpeg_parent}" CACHE PATH "FFmpeg root containing include/ and lib/ for C API linkage" FORCE)
+endif()
+
+set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
+set(FFMPEG_LIB_DIR "${FFMPEG_ROOT}/lib")
 
 # ── 패키지 탐색 ─────────────────────────────────────────────────
 find_package(Qt6 COMPONENTS Widgets Sql Multimedia MultimediaWidgets REQUIRED)
@@ -84,7 +94,6 @@ set(CMAKE_AUTORCC ON)
 add_executable(EdgeOn_Client
         src/main.cpp
         include/streamworker.h src/streamworker.cpp
-        include/recorderworker.h src/recorderworker.cpp
         include/videocell.h src/videocell.cpp
         include/mainwindow.h src/mainwindow.cpp
         src/DBManager.cpp
@@ -114,6 +123,9 @@ if(NOT SKIP_CUDA AND CUDAToolkit_FOUND)
 endif()
 
 target_link_directories(EdgeOn_Client PRIVATE ${OpenCV_LIB_DIR})
+if(EXISTS "${FFMPEG_LIB_DIR}")
+    target_link_directories(EdgeOn_Client PRIVATE ${FFMPEG_LIB_DIR})
+endif()
 
 if(EXISTS "${ONNXRUNTIME_LIB_DIR}")
     target_link_directories(EdgeOn_Client PRIVATE ${ONNXRUNTIME_LIB_DIR})
@@ -126,6 +138,10 @@ target_link_libraries(EdgeOn_Client PRIVATE
     Qt6::MultimediaWidgets
     opencv_world4130$<$<CONFIG:Debug>:d>
     onnxruntime
+    avformat
+    avcodec
+    avutil
+    swscale
 )
 
 if(WIN32)
@@ -136,6 +152,7 @@ target_include_directories(EdgeOn_Client PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${OpenCV_INCLUDE_DIRS}
     ${ONNXRUNTIME_INCLUDE_DIR}
+    ${FFMPEG_INCLUDE_DIR}
 )
 
 install(TARGETS EdgeOn_Client

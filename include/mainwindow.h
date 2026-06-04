@@ -13,7 +13,6 @@
 #include "Protocol.h"
 #include "videocell.h"
 #include "streamworker.h"
-#include "recorderworker.h"
 #include "yolov8inference.h"
 
 class QLabel;
@@ -50,8 +49,13 @@ private slots:
     void onRemoveRequested(int cellId);
     void onFrameReady     (int cameraId);
     void onStatusChanged  (int cameraId, const QString& status);
-    void onRecorderStatusChanged(int cameraId, const QString& status);
-    void onRecorderSegmentStarted(int cameraId, qint64 startUtcMs, int segmentSeconds, const QString& tempPath);
+    void onRecorderSegmentStarted(int cameraId,
+                                  qint64 startUtcMs,
+                                  int segmentSeconds,
+                                  const QString& tempPath,
+                                  qint64 startSourcePts,
+                                  int sourceTimeBaseNum,
+                                  int sourceTimeBaseDen);
     void onRecorderSegmentFinished(int cameraId, qint64 startUtcMs, qint64 endUtcMs, const QString& finalPath);
     void loadUrlsFromFile ();
     void removeAllStreams ();
@@ -77,9 +81,11 @@ private:
         cv::Size lastDetectionFrameSize{};
         qint64 recordSegmentStartUtcMs{0};
         qint64 recordSegmentEndUtcMs{0};
+        qint64 recordSegmentStartSourcePts{0};
+        int recordSegmentSourceTimeBaseNum{0};
+        int recordSegmentSourceTimeBaseDen{1};
         QString recordSegmentFilePath;
         StreamWorker* worker{nullptr};
-        RecorderWorker* recorder{nullptr};
         QSet<int> attachedCells;
     };
 

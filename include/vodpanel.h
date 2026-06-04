@@ -27,7 +27,7 @@ class VodVideoView;
 enum class FrameMatchMode {
     FRAME_UTC_MS,      // frame_utc_ms 기준 우선
     CAPTURE_UTC_MS,    // capture_utc_ms 기준 우선
-    AUTO               // frame_utc_ms 우선, 실패 시 capture_utc_ms 선택
+    AUTO               // segment_relative_ms 우선, 실패 시 capture_utc_ms/frame_utc_ms 선택
 };
 
 class VodPanel : public QWidget {
@@ -97,10 +97,18 @@ private:
     bool            m_isProgrammaticPause[kPlayerCount]{false, false};
     int             m_warmupGeneration[kPlayerCount]{0, 0};
     qint64          m_latestVideoAbsMs[kPlayerCount]{-1, -1};
+    qint64          m_latestVideoPosMs[kPlayerCount]{-1, -1};
+    qint64          m_lastOverlayMatchAbsMs[kPlayerCount]{-1, -1};
+    qint64          m_lastOverlayFrameUtcMs[kPlayerCount]{-1, -1};
+    qint64          m_lastOverlayFrameSeq[kPlayerCount]{-1, -1};
+    qint64          m_lastOverlayCommitWallMs[kPlayerCount]{0, 0};
+    bool            m_overlayVisible[kPlayerCount]{false, false};
 
     std::unordered_map<int, std::vector<detection_frame_group>> m_detectionCacheBySegIdx;
     FrameMatchMode  m_frameMatchMode{FrameMatchMode::AUTO};
 
     static constexpr qint64 kDetectionMatchToleranceMs = 80;
+    static constexpr qint64 kSegmentBoundaryPreferNextMs = 100;
+    static constexpr qint64 kOverlayHoldMs = 220;
 };
 
