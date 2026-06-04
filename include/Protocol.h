@@ -75,4 +75,9 @@ struct detection_result {
     QString record_segment_file_path;
 };
 
+struct detection_frame_group {
+    detection_frame_info frame;
+    std::vector<detection_result> detections;
+};
+
 #endif //EDGEON_CLIENT_PROTOCOL_H

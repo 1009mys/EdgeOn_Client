@@ -26,6 +26,9 @@ public:
     std::expected<void, QString> saveDetectionResults(const detection_frame_info& frameInfo,
                                                       const std::vector<detection_result>& detections);
     std::expected<void, QString> purgeDetectionResultsBefore(qint64 cutoffUtcMs);
+    std::expected<std::vector<detection_frame_group>, QString> listDetectionFramesByRange(int cameraId,
+                                                                                           qint64 startUtcMs,
+                                                                                           qint64 endUtcMs);
 
 
 private:

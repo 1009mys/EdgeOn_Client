@@ -227,7 +227,7 @@ int main(int argc, char* argv[]) {
 
     DBManager& dbManager = DBManager::instance("db.db");
     dbManager.initialize();
-
+    /*
     const std::string modelPath = "models/yolov8s.onnx";
     const fs::path imageDirectory = "E:\\datasets\\coco\\val2017\\val2017";
     constexpr size_t kMaxImages = 100;
@@ -250,7 +250,7 @@ int main(int argc, char* argv[]) {
         inference.close();
     } catch (const std::exception& ex) {
         std::cerr << "[YOLOv8] Error: " << ex.what() << std::endl;
-    }
+    }*/
 
     MainWindow w;
     w.show();

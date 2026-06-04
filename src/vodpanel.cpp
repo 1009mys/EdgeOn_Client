@@ -1,22 +1,27 @@
 #include "vodpanel.h"
 
+#include "DBManager.h"
+#include "vodvideoview.h"
+
 #include <QMediaPlayer>
 #include <QAudioOutput>
-#include <QVideoWidget>
 #include <QStackedLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QComboBox>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QTimer>
 #include <QDir>
+#include <QDebug>
 #include <QFileInfo>
 #include <QDateTime>
 #include <QRegularExpression>
 #include <QSizePolicy>
 #include <QUrl>
 #include <algorithm>
+#include <limits>
 
 namespace {
 constexpr qint64 kPrebufferLeadMs = 1500;  // 파일 경계 1.5초 전부터 다음 파일 선버퍼링
@@ -43,11 +48,30 @@ VodPanel::VodPanel(const QString& outputRoot, QWidget* parent)
         m_players[i]->setAudioOutput(m_audioOutputs[i]);
         m_audioOutputs[i]->setVolume(i == m_activeSlot ? kActiveVolume : kMuteVolume);
 
-        m_videoWidgets[i] = new QVideoWidget(videoHost);
-        m_videoWidgets[i]->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-        m_videoWidgets[i]->setStyleSheet("background: black;");
-        m_players[i]->setVideoOutput(m_videoWidgets[i]);
-        m_videoStack->addWidget(m_videoWidgets[i]);
+        // VodVideoView: QVideoSink 기반 비디오+BBox 합성 렌더러
+        // QVideoWidget(D3D11) 의 자식/형제 위젯을 덮어쓰는 문제를 우회한다.
+        m_views[i] = new VodVideoView(videoHost);
+        m_players[i]->setVideoSink(m_views[i]->videoSink());
+        m_videoStack->addWidget(m_views[i]);
+
+        connect(m_views[i], &VodVideoView::videoFrameTimestampChanged,
+                this, [this, i](qint64 timestampUs) {
+            if (timestampUs < 0) {
+                return;
+            }
+            const int segIdx = segmentIndexForSlot(i);
+            if (segIdx < 0 || segIdx >= m_segments.size()) {
+                return;
+            }
+
+            const qint64 framePosMs = timestampUs / 1000;
+            m_latestVideoAbsMs[i] = m_segments[segIdx].startMs + framePosMs;
+
+            if (i == m_activeSlot) {
+                // 실제 화면에 올라온 프레임 timestamp를 기준으로 오버레이를 갱신한다.
+                updateOverlayForAbsMs(m_timeline->positionMs());
+            }
+        });
 
         connect(m_players[i], &QMediaPlayer::positionChanged,
                 this, [this, i](qint64 posMs) { onPlayerPositionChanged(i, posMs); });
@@ -83,12 +107,40 @@ VodPanel::VodPanel(const QString& outputRoot, QWidget* parent)
     m_infoLabel->setStyleSheet("color:#888888; font-size:11px;");
     m_infoLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
+    // ── 프레임 매칭 모드 선택 콤보박스 ──────────────────────
+    auto* matchModeLabel = new QLabel("BBox 타이밍:", this);
+    matchModeLabel->setStyleSheet("color:#dddddd; font-size:11px;");
+
+    m_frameMatchModeBox = new QComboBox(this);
+    m_frameMatchModeBox->setFixedWidth(160);
+    m_frameMatchModeBox->addItem("frame_utc_ms", static_cast<int>(FrameMatchMode::FRAME_UTC_MS));
+    m_frameMatchModeBox->addItem("capture_utc_ms", static_cast<int>(FrameMatchMode::CAPTURE_UTC_MS));
+    m_frameMatchModeBox->addItem("자동 선택", static_cast<int>(FrameMatchMode::AUTO));
+    m_frameMatchModeBox->setCurrentIndex(2);  // AUTO 기본값
+    m_frameMatchModeBox->setStyleSheet(
+        "QComboBox { background:#2a2a2a; color:white; border:1px solid #444; border-radius:3px; padding:3px; }"
+        "QComboBox::drop-down { border:none; }"
+        "QComboBox QAbstractItemView { background:#2a2a2a; color:white; selection-background-color:#1e5080; }");
+
+    connect(m_frameMatchModeBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        FrameMatchMode mode = static_cast<FrameMatchMode>(m_frameMatchModeBox->itemData(index).toInt());
+        setFrameMatchMode(mode);
+        qDebug() << "[UI] Frame match mode changed to:" << static_cast<int>(mode);
+        // 현재 프레임 업데이트
+        if (m_activeSlot >= 0) {
+            updateOverlayForAbsMs(m_timeline->positionMs());
+        }
+    });
+
     auto* ctrlRow = new QHBoxLayout();
     ctrlRow->setContentsMargins(8, 4, 8, 4);
     ctrlRow->setSpacing(10);
     ctrlRow->addWidget(m_playBtn);
     ctrlRow->addWidget(m_timeLabel);
     ctrlRow->addStretch();
+    ctrlRow->addWidget(matchModeLabel);
+    ctrlRow->addWidget(m_frameMatchModeBox);
     ctrlRow->addWidget(m_infoLabel);
 
     // ── 힌트 레이블 ──────────────────────────────────────────
@@ -117,9 +169,12 @@ VodPanel::~VodPanel() = default;
 // ── 카메라 로드 ────────────────────────────────────────────────
 void VodPanel::loadCamera(int cameraId, int segmentSeconds) {
     resetPlayers();
+    m_currentCameraId = cameraId;
     m_segments.clear();
     m_activeSegIdx = kInvalidSegIdx;
     m_prebufferSegIdx = kInvalidSegIdx;
+    m_detectionCacheBySegIdx.clear();
+    clearAllOverlays();
 
     const QString cameraDir = QDir::cleanPath(
         m_outputRoot + QString("/camera_%1").arg(cameraId));
@@ -223,12 +278,19 @@ void VodPanel::onSeekRequested(qint64 absMs) {
     m_timeline->setPosition(absMs);
     const bool wasPlaying =
         m_players[m_activeSlot]->playbackState() == QMediaPlayer::PlayingState;
+    m_latestVideoAbsMs[m_activeSlot] = -1;
     playAt(absMs, wasPlaying);
+    updateOverlayForAbsMs(absMs);
 }
 
 void VodPanel::playAt(qint64 absMs, bool startPlaying) {
     const int idx = findSegmentIndex(absMs);
-    if (idx < 0) return;
+    if (idx < 0) {
+        clearAllOverlays();
+        return;
+    }
+
+    syncDetectionPrefetch(idx);
 
     const qint64 offset = absMs - m_segments[idx].startMs;
 
@@ -240,6 +302,7 @@ void VodPanel::playAt(qint64 absMs, bool startPlaying) {
             m_players[m_activeSlot]->playbackState() != QMediaPlayer::PlayingState;
         m_pendingSeekMs[m_activeSlot]         = offset;
         m_startPlayingOnReady[m_activeSlot]   = needPlay;
+        m_latestVideoAbsMs[m_activeSlot]       = -1;
         m_players[m_activeSlot]->setPosition(offset);
         prebufferNextSegment();
         return;
@@ -265,6 +328,7 @@ void VodPanel::playAt(qint64 absMs, bool startPlaying) {
         // duration/decoder 타이밍 이슈로 seek가 무시되는 경우가 있어 pending을 항상 유지한다.
         m_pendingSeekMs[nextActive] = offset;
         m_startPlayingOnReady[nextActive] = startPlaying;
+        m_latestVideoAbsMs[nextActive] = -1;
         tryApplyPendingSeek(nextActive);
 
         prebufferNextSegment();
@@ -298,8 +362,12 @@ void VodPanel::resetPlayers() {
         m_startPlayingOnReady[i] = false;
         m_isPrebufferWarmup[i] = false;
         m_isProgrammaticPause[i] = false;
+        m_latestVideoAbsMs[i] = -1;
         ++m_warmupGeneration[i];
         m_audioOutputs[i]->setVolume(i == m_activeSlot ? kActiveVolume : kMuteVolume);
+        if (m_views[i]) {
+            m_views[i]->clearDetections();
+        }
     }
 }
 
@@ -311,8 +379,12 @@ void VodPanel::clearPrebuffer() {
     m_startPlayingOnReady[standby] = false;
     m_isPrebufferWarmup[standby] = false;
     m_isProgrammaticPause[standby] = false;
+    m_latestVideoAbsMs[standby] = -1;
     ++m_warmupGeneration[standby];
     m_prebufferSegIdx = kInvalidSegIdx;
+    if (m_views[standby]) {
+        m_views[standby]->clearDetections();
+    }
 }
 
 void VodPanel::switchToSlot(int slot) {
@@ -323,6 +395,7 @@ void VodPanel::switchToSlot(int slot) {
     for (int i = 0; i < kPlayerCount; ++i) {
         m_audioOutputs[i]->setVolume(i == m_activeSlot ? kActiveVolume : kMuteVolume);
     }
+    updateOverlayForAbsMs(m_timeline->positionMs());
 }
 
 void VodPanel::loadSegmentToSlot(int slot, int segIdx, qint64 offsetMs, bool startPlaying) {
@@ -330,6 +403,7 @@ void VodPanel::loadSegmentToSlot(int slot, int segIdx, qint64 offsetMs, bool sta
 
     m_pendingSeekMs[slot] = qMax<qint64>(0, offsetMs);
     m_startPlayingOnReady[slot] = startPlaying;
+    m_latestVideoAbsMs[slot] = -1;
 
     // active 슬롯은 warmup을 수행하면 offset이 0으로 되돌아갈 수 있으므로 금지한다.
     const bool isStandbySlot = (slot != m_activeSlot);
@@ -385,6 +459,7 @@ void VodPanel::onPlayerPositionChanged(int slot, qint64 posMs) {
     m_timeline->setPosition(absMs);
     m_timeLabel->setText(
         QDateTime::fromMSecsSinceEpoch(absMs).toString("yyyy/MM/dd  HH:mm:ss"));
+    updateOverlayForAbsMs(absMs);
 
     const qint64 remainingMs = m_segments[m_activeSegIdx].endMs - absMs;
     if (remainingMs <= kPrebufferLeadMs) {
@@ -464,6 +539,7 @@ void VodPanel::onPlaybackStateChanged(int slot, QMediaPlayer::PlaybackState) {
     }
 
     if (slot == m_activeSlot) {
+        updateOverlayForAbsMs(m_timeline->positionMs());
         updateControls();
     }
 }
@@ -504,6 +580,215 @@ void VodPanel::tryApplyPendingSeek(int slot)
     }
 
     player->setPosition(target);
+}
+
+void VodPanel::prefetchDetectionsForSegment(int segIdx)
+{
+    if (m_currentCameraId <= 0) return;
+    if (segIdx < 0 || segIdx >= m_segments.size()) return;
+    if (m_detectionCacheBySegIdx.contains(segIdx)) return;
+
+    const auto& seg = m_segments[segIdx];
+    // 녹화 시작/종료 타임스탬프(파일명 기반)와 frame_utc_ms(스트림 캡처 시각) 간
+    // 인코딩 버퍼·지연 등으로 수 초 오프셋이 발생할 수 있으므로 ±5초 마진을 추가한다.
+    constexpr qint64 kQueryMarginMs = 5000;
+    const qint64 queryStartMs = seg.startMs - kQueryMarginMs;
+    const qint64 queryEndMs   = seg.endMs   + kQueryMarginMs;
+
+    qDebug() << "[Overlay] prefetch segIdx=" << segIdx
+             << " camera=" << m_currentCameraId
+             << " range=[" << queryStartMs << "," << queryEndMs << "]";
+
+    const auto result = DBManager::instance().listDetectionFramesByRange(
+        m_currentCameraId,
+        queryStartMs,
+        queryEndMs);
+    if (!result) {
+        qWarning() << "VOD detection 조회 실패:" << result.error()
+                   << "camera_id=" << m_currentCameraId
+                   << "seg_idx=" << segIdx;
+        m_detectionCacheBySegIdx.emplace(segIdx, std::vector<detection_frame_group>{});
+        return;
+    }
+
+    qDebug() << "[Overlay] prefetch done: " << result->size() << " frames for segIdx=" << segIdx;
+    m_detectionCacheBySegIdx.emplace(segIdx, *result);
+}
+
+void VodPanel::syncDetectionPrefetch(int segIdx)
+{
+    if (segIdx < 0 || segIdx >= m_segments.size()) {
+        m_detectionCacheBySegIdx.clear();
+        return;
+    }
+
+    prefetchDetectionsForSegment(segIdx);
+    prefetchDetectionsForSegment(segIdx + 1);
+
+    for (auto it = m_detectionCacheBySegIdx.begin(); it != m_detectionCacheBySegIdx.end();) {
+        const bool keepCurrent = (it->first == segIdx);
+        const bool keepNext = (it->first == segIdx + 1);
+        if (!keepCurrent && !keepNext) {
+            it = m_detectionCacheBySegIdx.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+
+int VodPanel::segmentIndexForSlot(int slot) const
+{
+    if (slot == m_activeSlot) {
+        return m_activeSegIdx;
+    }
+    if (slot == standbySlot()) {
+        return m_prebufferSegIdx;
+    }
+    return kInvalidSegIdx;
+}
+
+const detection_frame_group* VodPanel::findBestFrameForAbsMs(const std::vector<detection_frame_group>& frames,
+                                                              qint64 absMs) const
+{
+     if (frames.empty()) {
+         return nullptr;
+     }
+
+     // frame_utc_ms 기준 최근접 프레임 탐색
+     const detection_frame_group* bestByFrameUtc = nullptr;
+     qint64 bestFrameDelta = std::numeric_limits<qint64>::max();
+     for (const auto& frame : frames) {
+         const qint64 delta = qAbs(frame.frame.frame_utc_ms - absMs);
+         if (delta < bestFrameDelta) {
+             bestFrameDelta = delta;
+             bestByFrameUtc = &frame;
+         }
+     }
+
+     // capture_utc_ms 기준 최근접 프레임 탐색
+     const detection_frame_group* bestByCaptureUtc = nullptr;
+     qint64 bestCaptureDelta = std::numeric_limits<qint64>::max();
+     for (const auto& frame : frames) {
+         if (frame.frame.capture_utc_ms <= 0) {
+             continue;
+         }
+         const qint64 delta = qAbs(frame.frame.capture_utc_ms - absMs);
+         if (delta < bestCaptureDelta) {
+             bestCaptureDelta = delta;
+             bestByCaptureUtc = &frame;
+         }
+     }
+
+     // 선택된 모드에 따라 매칭 우선순위 결정
+     if (m_frameMatchMode == FrameMatchMode::FRAME_UTC_MS) {
+         // frame_utc_ms 우선 모드
+         if (bestByFrameUtc && bestFrameDelta <= kDetectionMatchToleranceMs) {
+             qDebug() << "[Overlay] FRAME_UTC_MS mode: frame_utc_ms match delta=" << bestFrameDelta << "ms";
+             return bestByFrameUtc;
+         }
+         qDebug() << "[Overlay] FRAME_UTC_MS mode: no match within tolerance, best delta=" << bestFrameDelta << "ms";
+         return nullptr;
+     }
+     else if (m_frameMatchMode == FrameMatchMode::CAPTURE_UTC_MS) {
+         // capture_utc_ms 우선 모드
+         if (bestByCaptureUtc && bestCaptureDelta <= kDetectionMatchToleranceMs) {
+             qDebug() << "[Overlay] CAPTURE_UTC_MS mode: capture_utc_ms match delta=" << bestCaptureDelta << "ms";
+             return bestByCaptureUtc;
+         }
+         qDebug() << "[Overlay] CAPTURE_UTC_MS mode: no match within tolerance, best delta=" << bestCaptureDelta << "ms";
+         return nullptr;
+     }
+     else {
+         // AUTO 모드 (기본): frame_utc_ms 우선, 실패 시 capture_utc_ms
+         if (bestByFrameUtc && bestFrameDelta <= kDetectionMatchToleranceMs) {
+             qDebug() << "[Overlay] AUTO mode: frame_utc_ms match delta=" << bestFrameDelta << "ms";
+             return bestByFrameUtc;
+         }
+         if (bestByCaptureUtc && bestCaptureDelta <= kDetectionMatchToleranceMs) {
+             qDebug() << "[Overlay] AUTO mode: capture_utc_ms match delta=" << bestCaptureDelta << "ms";
+             return bestByCaptureUtc;
+         }
+         qDebug() << "[Overlay] AUTO mode: no match within tolerance,"
+                  << "frame_delta=" << bestFrameDelta << "ms"
+                  << "capture_delta=" << bestCaptureDelta << "ms";
+         return nullptr;
+     }
+}
+
+
+void VodPanel::updateOverlayForAbsMs(qint64 absMs)
+{
+    // activeSegIdx 체크를 제거 — 세그먼트 검색 결과로만 판단한다.
+    if (m_segments.isEmpty()) {
+        clearAllOverlays();
+        return;
+    }
+
+    qint64 matchAbsMs = absMs;
+    if (m_latestVideoAbsMs[m_activeSlot] >= 0) {
+        matchAbsMs = m_latestVideoAbsMs[m_activeSlot];
+    }
+
+    const int segIdx = findSegmentIndex(matchAbsMs);
+    if (segIdx < 0) {
+        clearAllOverlays();
+        return;
+    }
+
+    syncDetectionPrefetch(segIdx);
+
+    for (int i = 0; i < kPlayerCount; ++i) {
+        if (i != m_activeSlot && m_views[i]) {
+            m_views[i]->clearDetections();
+        }
+    }
+
+    auto* view = m_views[m_activeSlot];
+    if (!view) {
+        return;
+    }
+
+    const auto cacheIt = m_detectionCacheBySegIdx.find(segIdx);
+    if (cacheIt == m_detectionCacheBySegIdx.end()) {
+        qDebug() << "[Overlay] cache miss for segIdx=" << segIdx;
+        view->clearDetections();
+        return;
+    }
+
+    qDebug() << "[Overlay] segIdx=" << segIdx
+             << " cache frames=" << cacheIt->second.size()
+             << " requestAbsMs=" << absMs
+             << " matchAbsMs=" << matchAbsMs;
+
+    if (cacheIt->second.empty()) {
+        qDebug() << "[Overlay] empty frames in cache";
+        view->clearDetections();
+        return;
+    }
+
+    const detection_frame_group* bestFrame = findBestFrameForAbsMs(cacheIt->second, matchAbsMs);
+    if (!bestFrame) {
+        qDebug() << "[Overlay] no best frame";
+        view->clearDetections();
+        return;
+    }
+
+    qDebug() << "[Overlay] bestFrame frame_utc_ms=" << bestFrame->frame.frame_utc_ms
+             << " detections=" << bestFrame->detections.size()
+             << " frameSize=" << bestFrame->frame.frame_width << "x" << bestFrame->frame.frame_height;
+
+    view->setDetections(bestFrame->frame.frame_width,
+                        bestFrame->frame.frame_height,
+                        bestFrame->detections);
+}
+
+void VodPanel::clearAllOverlays()
+{
+    for (int i = 0; i < kPlayerCount; ++i) {
+        if (m_views[i]) {
+            m_views[i]->clearDetections();
+        }
+    }
 }
 
 // ── 재생 / 일시정지 ────────────────────────────────────────────

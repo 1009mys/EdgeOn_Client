@@ -93,6 +93,8 @@ add_executable(EdgeOn_Client
         include/Protocol.h
         include/vodtimeline.h src/vodtimeline.cpp
         include/vodpanel.h src/vodpanel.cpp
+        include/vodvideoview.h src/vodvideoview.cpp
+        include/vodvideooverlay.h src/vodvideooverlay.cpp
         include/onnxinference.h src/onnxinference.cpp
         include/yolov8inference.h src/yolov8inference.cpp
 )

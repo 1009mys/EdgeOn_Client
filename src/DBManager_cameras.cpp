@@ -6,6 +6,8 @@
 #include <QStringList>
 #include <QVariant>
 
+#include <limits>
+
 namespace {
 
 camera_info parseCameraRow(const QSqlQuery& query)
@@ -453,6 +455,141 @@ std::expected<void, QString> DBManager::purgeDetectionResultsBefore(qint64 cutof
     }
 
     return {};
+}
+
+std::expected<std::vector<detection_frame_group>, QString> DBManager::listDetectionFramesByRange(int cameraId,
+                                                                                                  qint64 startUtcMs,
+                                                                                                  qint64 endUtcMs)
+{
+    if (cameraId <= 0) {
+        return std::unexpected(QString("camera_id는 1 이상이어야 합니다."));
+    }
+    if (startUtcMs <= 0 || endUtcMs <= 0 || endUtcMs < startUtcMs) {
+        return std::unexpected(QString("조회 시간구간이 올바르지 않습니다."));
+    }
+
+    QSqlQuery query(db);
+    if (!query.prepare(R"(
+        SELECT
+            f.camera_id,
+            f.frame_utc_ms,
+            f.frame_seq,
+            f.capture_utc_ms,
+            f.stored_utc_ms,
+            f.frame_width,
+            f.frame_height,
+            f.stream_url,
+            f.model_name,
+            f.model_provider,
+            f.model_input_width,
+            f.model_input_height,
+            f.confidence_threshold,
+            f.iou_threshold,
+            f.inference_ms,
+            f.detection_count,
+            f.record_requested,
+            f.analysis_enabled,
+            f.record_segment_start_utc_ms,
+            f.record_segment_end_utc_ms,
+            f.record_segment_file_path,
+            d.det_index,
+            d.class_id,
+            d.score,
+            d.box_x,
+            d.box_y,
+            d.box_width,
+            d.box_height
+        FROM detection_frames AS f
+        LEFT JOIN detections AS d
+               ON d.camera_id = f.camera_id
+              AND d.frame_utc_ms = f.frame_utc_ms
+              AND d.frame_seq = f.frame_seq
+        WHERE f.camera_id = :camera_id
+          AND f.frame_utc_ms >= :start_utc_ms
+          AND f.frame_utc_ms <= :end_utc_ms
+        ORDER BY f.frame_utc_ms ASC, f.frame_seq ASC, d.det_index ASC
+    )")) {
+        return std::unexpected(query.lastError().text());
+    }
+
+    query.bindValue(":camera_id", cameraId);
+    query.bindValue(":start_utc_ms", startUtcMs);
+    query.bindValue(":end_utc_ms", endUtcMs);
+
+    if (!query.exec()) {
+        return std::unexpected(query.lastError().text());
+    }
+
+    std::vector<detection_frame_group> groups;
+    qint64 currentFrameUtcMs = std::numeric_limits<qint64>::min();
+    qint64 currentFrameSeq = std::numeric_limits<qint64>::min();
+
+    while (query.next()) {
+        const qint64 frameUtcMs = query.value(1).toLongLong();
+        const qint64 frameSeq = query.value(2).toLongLong();
+
+        if (groups.empty() || frameUtcMs != currentFrameUtcMs || frameSeq != currentFrameSeq) {
+            detection_frame_group group;
+            group.frame.camera_id = query.value(0).toInt();
+            group.frame.frame_utc_ms = frameUtcMs;
+            group.frame.frame_seq = frameSeq;
+            group.frame.capture_utc_ms = query.value(3).toLongLong();
+            group.frame.frame_width = query.value(5).toInt();
+            group.frame.frame_height = query.value(6).toInt();
+            group.frame.stream_url = query.value(7).toString();
+            group.frame.model_name = query.value(8).toString();
+            group.frame.model_provider = query.value(9).toString();
+            group.frame.model_input_width = query.value(10).toInt();
+            group.frame.model_input_height = query.value(11).toInt();
+            group.frame.confidence_threshold = query.value(12).toFloat();
+            group.frame.iou_threshold = query.value(13).toFloat();
+            group.frame.inference_ms = query.value(14).toDouble();
+            group.frame.detection_count = query.value(15).toInt();
+            group.frame.record_requested = query.value(16).toInt() != 0;
+            group.frame.analysis_enabled = query.value(17).toInt() != 0;
+            group.frame.record_segment_start_utc_ms = query.value(18).toLongLong();
+            group.frame.record_segment_end_utc_ms = query.value(19).toLongLong();
+            group.frame.record_segment_file_path = query.value(20).toString();
+
+            groups.push_back(std::move(group));
+            currentFrameUtcMs = frameUtcMs;
+            currentFrameSeq = frameSeq;
+        }
+
+        if (query.isNull(21)) {
+            continue;
+        }
+
+        detection_result det;
+        det.camera_id = query.value(0).toInt();
+        det.frame_utc_ms = frameUtcMs;
+        det.frame_seq = frameSeq;
+        det.det_index = query.value(21).toInt();
+        det.capture_utc_ms = query.value(3).toLongLong();
+        det.frame_width = query.value(5).toInt();
+        det.frame_height = query.value(6).toInt();
+        det.stream_url = query.value(7).toString();
+        det.model_name = query.value(8).toString();
+        det.model_provider = query.value(9).toString();
+        det.model_input_width = query.value(10).toInt();
+        det.model_input_height = query.value(11).toInt();
+        det.confidence_threshold = query.value(12).toFloat();
+        det.iou_threshold = query.value(13).toFloat();
+        det.inference_ms = query.value(14).toDouble();
+        det.class_id = query.value(22).toInt();
+        det.score = query.value(23).toFloat();
+        det.box_x = query.value(24).toFloat();
+        det.box_y = query.value(25).toFloat();
+        det.box_width = query.value(26).toFloat();
+        det.box_height = query.value(27).toFloat();
+        det.record_segment_start_utc_ms = query.value(18).toLongLong();
+        det.record_segment_end_utc_ms = query.value(19).toLongLong();
+        det.record_segment_file_path = query.value(20).toString();
+
+        groups.back().detections.push_back(std::move(det));
+    }
+
+    return groups;
 }
 
 std::expected<void, QString> DBManager::addCamera(const camera_info& camera)
